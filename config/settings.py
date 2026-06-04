@@ -29,24 +29,24 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 # ==========================================
 # شروط الفلترة
 # ==========================================
-MAX_DISTANCE_FROM_LOD    = 0.10   # أقصى بُعد عن القاع (10%)
-MIN_DAILY_VOLUME_USD     = 5_000_000  # 5 مليون دولار
-RSI_OVERSOLD_THRESHOLD   = 35
-RSI_PERIOD               = 14
-LOD_DAYS                 = 180
-GITHUB_MAX_INACTIVE_DAYS = 90
+MAX_DISTANCE_FROM_LOD    = float(os.getenv("MAX_DISTANCE_FROM_LOD", "0.10"))
+MIN_DAILY_VOLUME_USD     = float(os.getenv("MIN_DAILY_VOLUME_USD", "5000000"))
+RSI_OVERSOLD_THRESHOLD   = float(os.getenv("RSI_OVERSOLD_THRESHOLD", "35"))
+RSI_PERIOD               = int(os.getenv("RSI_PERIOD", "14"))
+LOD_DAYS                 = int(os.getenv("LOD_DAYS", "180"))
+GITHUB_MAX_INACTIVE_DAYS = int(os.getenv("GITHUB_MAX_INACTIVE_DAYS", "90"))
 
 # ==========================================
 # إعدادات الصفقة
 # ==========================================
-STOP_LOSS_PCT  = 0.08   # 8% تحت القاع
-TP1_PCT        = 0.30
-TP2_PCT        = 0.60
-TP3_PCT        = 1.00
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.08"))
+TP1_PCT       = float(os.getenv("TP1_PCT", "0.30"))
+TP2_PCT       = float(os.getenv("TP2_PCT", "0.60"))
+TP3_PCT       = float(os.getenv("TP3_PCT", "1.00"))
 
-TP1_QTY_PCT    = 0.40
-TP2_QTY_PCT    = 0.35
-TP3_QTY_PCT    = 0.25
+TP1_QTY_PCT   = float(os.getenv("TP1_QTY_PCT", "0.40"))
+TP2_QTY_PCT   = float(os.getenv("TP2_QTY_PCT", "0.35"))
+TP3_QTY_PCT   = float(os.getenv("TP3_QTY_PCT", "0.25"))
 
 TRADE_AMOUNT_USD = float(os.getenv("TRADE_AMOUNT_USD", "100"))
 MAX_OPEN_TRADES  = int(os.getenv("MAX_OPEN_TRADES", "3"))
