@@ -1,12 +1,10 @@
 """
 core/scanner.py
-===============
-قلب النظام - يفحص السوق عبر MEXC ويبحث عن فرص Bottom Fisher
 """
 
 import ccxt
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 import time
 from typing import Optional
 from dataclasses import dataclass, field
@@ -20,9 +18,19 @@ from utils.logger import logger
 from utils.github_checker import is_github_active
 
 
+def calculate_rsi(closes: pd.Series, period: int = 14) -> float:
+    delta    = closes.diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    rs       = avg_gain / avg_loss.replace(0, np.nan)
+    rsi      = 100 - (100 / (1 + rs))
+    return float(rsi.iloc[-1])
+
+
 @dataclass
 class TradeOpportunity:
-    """يحتوي على كل معلومات الفرصة المكتشفة"""
     symbol:            str
     current_price:     float
     lod_180:           float
@@ -32,11 +40,11 @@ class TradeOpportunity:
     nearest_support:   float
     github_active:     bool
 
-    entry_price:  float = field(init=False)
-    stop_loss:    float = field(init=False)
-    tp1:          float = field(init=False)
-    tp2:          float = field(init=False)
-    tp3:          float = field(init=False)
+    entry_price: float = field(init=False)
+    stop_loss:   float = field(init=False)
+    tp1:         float = field(init=False)
+    tp2:         float = field(init=False)
+    tp3:         float = field(init=False)
 
     def __post_init__(self):
         from config.settings import STOP_LOSS_PCT, TP1_PCT, TP2_PCT, TP3_PCT
@@ -56,7 +64,6 @@ class TradeOpportunity:
 
 
 class MarketScanner:
-    """يتصل بـ MEXC ويفحص السوق"""
 
     def __init__(self):
         self.exchange = self._connect()
@@ -91,22 +98,15 @@ class MarketScanner:
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
             df.set_index("timestamp", inplace=True)
             return df.astype(float)
-        except ccxt.NetworkError as e:
-            logger.warning(f"[Scanner] خطأ شبكة {symbol}: {e}")
-            return None
-        except ccxt.ExchangeError as e:
-            logger.warning(f"[Scanner] خطأ منصة {symbol}: {e}")
-            return None
         except Exception as e:
-            logger.error(f"[Scanner] خطأ {symbol}: {e}")
+            logger.warning(f"[Scanner] {symbol}: {e}")
             return None
 
     def calculate_indicators(self, df: pd.DataFrame) -> dict:
-        df["rsi"] = ta.rsi(df["close"], length=RSI_PERIOD)
-        current_rsi   = float(df["rsi"].iloc[-1])
-        lod_180       = float(df["low"].tail(LOD_DAYS).min())
-        current_price = float(df["close"].iloc[-1])
-        distance      = (current_price - lod_180) / lod_180 if lod_180 > 0 else 1.0
+        current_rsi     = calculate_rsi(df["close"], period=RSI_PERIOD)
+        lod_180         = float(df["low"].tail(LOD_DAYS).min())
+        current_price   = float(df["close"].iloc[-1])
+        distance        = (current_price - lod_180) / lod_180 if lod_180 > 0 else 1.0
         nearest_support = float(df["low"].tail(20).min())
         return {
             "rsi": current_rsi, "lod_180": lod_180,
@@ -127,13 +127,9 @@ class MarketScanner:
         if volume_usd < MIN_DAILY_VOLUME_USD:
             return False
         rsi = indicators["rsi"]
-        if pd.isna(rsi) or rsi >= RSI_OVERSOLD_THRESHOLD:
+        if np.isnan(rsi) or rsi >= RSI_OVERSOLD_THRESHOLD:
             return False
-        logger.info(
-            f"✅ {symbol} | RSI: {rsi:.1f} "
-            f"| البعد: {indicators['distance']:.1%} "
-            f"| الحجم: ${volume_usd:,.0f}"
-        )
+        logger.info(f"✅ {symbol} | RSI: {rsi:.1f} | البعد: {indicators['distance']:.1%} | الحجم: ${volume_usd:,.0f}")
         return True
 
     def scan_market(self) -> list[TradeOpportunity]:
@@ -144,42 +140,28 @@ class MarketScanner:
         for i, symbol in enumerate(symbols, 1):
             if i % 50 == 0:
                 logger.info(f"[Scan] {i}/{len(symbols)}")
-
             df = self.fetch_ohlcv_daily(symbol)
             if df is None:
                 continue
-
             try:
                 indicators = self.calculate_indicators(df)
             except Exception as e:
-                logger.warning(f"[Scan] فشل مؤشرات {symbol}: {e}")
+                logger.warning(f"[Scan] فشل {symbol}: {e}")
                 continue
-
             volume_usd = self.get_24h_volume_usd(symbol)
-
             if not self.passes_filters(symbol, indicators, volume_usd):
                 continue
-
             coin_name = symbol.replace("/USDT", "")
             if not is_github_active(coin_name):
-                logger.info(f"[GitHub] {symbol}: مشروع غير نشط ❌")
                 continue
-
             opp = TradeOpportunity(
-                symbol=symbol,
-                current_price=indicators["current_price"],
-                lod_180=indicators["lod_180"],
-                distance_from_lod=indicators["distance"],
-                rsi_daily=indicators["rsi"],
-                volume_24h_usd=volume_usd,
-                nearest_support=indicators["nearest_support"],
-                github_active=True,
+                symbol=symbol, current_price=indicators["current_price"],
+                lod_180=indicators["lod_180"], distance_from_lod=indicators["distance"],
+                rsi_daily=indicators["rsi"], volume_24h_usd=volume_usd,
+                nearest_support=indicators["nearest_support"], github_active=True,
             )
             opportunities.append(opp)
-            logger.info(
-                f"💎 فرصة: {symbol} | دخول: {opp.entry_price:.6f} "
-                f"| SL: {opp.stop_loss:.6f} | R/R: {opp.risk_reward_ratio}"
-            )
+            logger.info(f"💎 {symbol} | دخول: {opp.entry_price:.6f} | SL: {opp.stop_loss:.6f}")
             time.sleep(0.3)
 
         logger.info(f"✅ اكتمل: {len(opportunities)} فرصة من {len(symbols)} عملة")
