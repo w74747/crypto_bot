@@ -2,7 +2,6 @@
 core/ai_analyst.py
 ==================
 نقاش الخبراء الثلاثي — Claude + Gemini + Grok
-APIs مصححة بالكامل
 """
 
 import os
@@ -15,9 +14,10 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
 GROK_API_KEY      = os.getenv("GROK_API_KEY", "")
 
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
-GEMINI_MODEL = "gemini-1.5-flash"
-GROK_MODEL   = "grok-3-fast"
+# النماذج — قابلة للتغيير من Railway
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GROK_MODEL   = os.getenv("GROK_MODEL",   "grok-3-fast")
 MAX_TOKENS   = 350
 
 STYLE = (
@@ -26,6 +26,11 @@ STYLE = (
     "جمل قصيرة ومباشرة. لا تتجاوز 80 كلمة. "
     "في نهاية ردك اكتب موقفك: موافق أو محايد أو رافض."
 )
+
+CLAUDE_SYS = f"أنت محلل فني للعملات الرقمية. ركّز على المؤشرات الفنية فقط. {STYLE}"
+GEMINI_SYS = f"أنت خبير مخاطر للعملات الرقمية. ركّز على المخاطر المالية فقط. {STYLE}"
+GROK_SYS   = f"أنت محلل مجتمع X للعملات الرقمية. أبلّغ عن مزاج X والمؤسسين فقط. {STYLE}"
+
 
 # ==========================================
 # بيانات الفرصة
@@ -97,13 +102,12 @@ def ask_claude(system: str, messages: list[dict]) -> str:
 
 
 # ==========================================
-# Gemini API — الصيغة الصحيحة
+# Gemini API
 # ==========================================
 def ask_gemini(system: str, user_msg: str) -> str:
     if not GEMINI_API_KEY:
         return "مفتاح Gemini غير موجود"
     try:
-        # الصيغة الصحيحة: system في أول رسالة من النموذج
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -111,7 +115,7 @@ def ask_gemini(system: str, user_msg: str) -> str:
         body = {
             "contents": [
                 {
-                    "role": "user",
+                    "role":  "user",
                     "parts": [{"text": f"{system}\n\n{user_msg}"}]
                 }
             ],
@@ -130,44 +134,27 @@ def ask_gemini(system: str, user_msg: str) -> str:
 
 
 # ==========================================
-# Grok API — صيغة OpenAI الصحيحة
+# Grok API — OpenAI format
 # ==========================================
-def ask_grok(system: str, user_msg: str, use_x_search: bool = False) -> str:
+def ask_grok(system: str, user_msg: str) -> str:
     if not GROK_API_KEY:
         return "مفتاح Grok غير موجود"
     try:
-        # Grok يستخدم OpenAI Chat Completions format
-        body = {
-            "model":    GROK_MODEL,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user_msg},
-            ],
-            "max_tokens":  MAX_TOKENS,
-            "temperature": 0.2,
-        }
-
-        if use_x_search:
-            body["tools"] = [{
-                "type": "function",
-                "function": {
-                    "name":        "search_x",
-                    "description": "Search X/Twitter for recent posts",
-                    "parameters": {
-                        "type":       "object",
-                        "properties": {"query": {"type": "string"}},
-                        "required":   ["query"],
-                    },
-                },
-            }]
-
         r = requests.post(
             "https://api.x.ai/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {GROK_API_KEY}",
                 "Content-Type":  "application/json",
             },
-            json=body,
+            json={
+                "model":       GROK_MODEL,
+                "max_tokens":  MAX_TOKENS,
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user_msg},
+                ],
+            },
             timeout=40,
         )
         r.raise_for_status()
@@ -179,15 +166,7 @@ def ask_grok(system: str, user_msg: str, use_x_search: bool = False) -> str:
 
 
 # ==========================================
-# System Prompts
-# ==========================================
-CLAUDE_SYS = f"أنت محلل فني للعملات الرقمية. ركّز على المؤشرات الفنية فقط. {STYLE}"
-GEMINI_SYS = f"أنت خبير مخاطر للعملات الرقمية. ركّز على المخاطر المالية فقط. {STYLE}"
-GROK_SYS   = f"أنت محلل مجتمع X للعملات الرقمية. أبلّغ عن مزاج X والمؤسسين فقط. {STYLE}"
-
-
-# ==========================================
-# النقاش الرئيسي
+# النقاش الرئيسي — 3 جولات
 # ==========================================
 def run_expert_debate(opp: TradeOpportunity) -> dict:
     coin = opp.symbol.replace("/USDT", "")
@@ -198,79 +177,79 @@ def run_expert_debate(opp: TradeOpportunity) -> dict:
         log.append({"round": round_num, "speaker": speaker, "text": text})
         logger.info(f"[Debate R{round_num}] {speaker}: {text[:60]}...")
 
-    # ── جولة 1: تحليل مستقل ──
+    # ── جولة 1 ──
     logger.info(f"[Debate] جولة 1 — {opp.symbol}")
 
-    c1 = ask_claude(CLAUDE_SYS, (
+    c1 = ask_claude(CLAUDE_SYS, [{"role": "user", "content":
         f"البيانات: {data}\n\n"
         f"حلّل المؤشرات الفنية. هل الإشارة قوية؟ هل نقاط الدخول منطقية؟"
-    ))
+    }])
     rec(1, "Claude", c1)
 
-    g1 = ask_gemini(GEMINI_SYS, (
+    g1 = ask_gemini(GEMINI_SYS,
         f"البيانات: {data}\n\n"
         f"قيّم المخاطر. هل الحجم كافٍ؟ هل وقف الخسارة منطقي؟"
-    ))
+    )
     rec(1, "Gemini", g1)
 
-    grok1 = ask_grok(GROK_SYS, (
-        f"ابحث عن {coin} crypto على X. "
-        f"ما مزاج المجتمع؟ هل المؤسسون نشطون؟ أي أخبار حديثة؟\n"
+    grok1 = ask_grok(GROK_SYS,
+        f"ما مزاج مجتمع X تجاه {coin} crypto؟ "
+        f"هل المؤسسون نشطون؟ أي أخبار حديثة إيجابية أو سلبية؟\n"
         f"البيانات: {data}"
-    ), use_x_search=False)  # نعطّل X Search مؤقتاً لتجنب أخطاء التنسيق
+    )
     rec(1, "Grok", grok1)
 
-    # ── جولة 2: ردود متقاطعة ──
+    # ── جولة 2 ──
     logger.info(f"[Debate] جولة 2 — {opp.symbol}")
 
-    c2 = ask_claude(CLAUDE_SYS, (
+    c2 = ask_claude(CLAUDE_SYS, [{"role": "user", "content":
         f"البيانات: {data}\n\n"
         f"رأي خبير المخاطر: {_trim(g1)}\n"
         f"رأي محلل X: {_trim(grok1)}\n\n"
         f"هل تتفق معهما فنياً؟ ما الذي يغير رأيك؟"
-    ))
+    }])
     rec(2, "Claude", c2)
 
-    g2 = ask_gemini(GEMINI_SYS, (
+    g2 = ask_gemini(GEMINI_SYS,
         f"البيانات: {data}\n\n"
         f"رأي المحلل الفني: {_trim(c1)}\n"
         f"رأي محلل X: {_trim(grok1)}\n\n"
         f"هل التحليل الفني يطمئنك من ناحية المخاطر؟"
-    ))
+    )
     rec(2, "Gemini", g2)
 
-    grok2 = ask_grok(GROK_SYS, (
+    grok2 = ask_grok(GROK_SYS,
         f"البيانات: {data}\n\n"
         f"رأي المحلل الفني: {_trim(c1)}\n"
         f"رأي خبير المخاطر: {_trim(g1)}\n\n"
         f"هل ما تعرفه عن {coin} على X يدعم أو يعارض تحليلهما؟"
-    ))
+    )
     rec(2, "Grok", grok2)
 
     # ── جولة 3: الحكم النهائي ──
     logger.info(f"[Debate] جولة 3 — {opp.symbol}")
 
-    c3 = ask_claude(CLAUDE_SYS, (
+    c3 = ask_claude(CLAUDE_SYS, [{"role": "user", "content":
         f"البيانات: {data}\n\n"
-        f"بعد النقاش مع خبير المخاطر والمحلل الاجتماعي:\n"
+        f"بعد النقاش:\n"
         f"المخاطر: {_trim(g2)}\n"
         f"X: {_trim(grok2)}\n\n"
-        f"اكتب: نقطة اتفاق واحدة، نقطة خلاف واحدة، التوصية، درجة الثقة."
-    ))
+        f"اكتب: نقطة اتفاق، نقطة خلاف، التوصية، درجة الثقة."
+    }])
     rec(3, "Claude", c3)
 
-    g3 = ask_gemini(GEMINI_SYS, (
-        f"الحكم النهائي للمحلل الفني: {_trim(c3)}\n\n"
+    g3 = ask_gemini(GEMINI_SYS,
+        f"حكم المحلل الفني: {_trim(c3)}\n\n"
         f"البيانات: {data}\n\n"
         f"هل توافق؟ ما أكبر خطر قائم؟ جملة واحدة للمتداول."
-    ))
+    )
     rec(3, "Gemini", g3)
 
-    grok3 = ask_grok(GROK_SYS, (
+    grok3 = ask_grok(GROK_SYS,
         f"حكم المحلل الفني: {_trim(c3)}\n"
         f"رأي خبير المخاطر: {_trim(g3)}\n\n"
-        f"هل مجتمع X يدعم هذا؟ جملة ختامية واحدة."
-    ))
+        f"هل مجتمع X يدعم هذا الحكم؟ جملة ختامية واحدة."
+    )
     rec(3, "Grok", grok3)
 
     recommendation = _extract_recommendation(c3, g3, grok3)
@@ -306,14 +285,18 @@ def _extract_recommendation(c: str, g: str, grok: str) -> dict:
     ap    = sum(1 for v in votes.values() if v == "approve")
     rj    = sum(1 for v in votes.values() if v == "reject")
 
-    if   ap == 3:           label, emoji, conf = "إجماع على الدخول",   "🟢", "عالية جداً 🔥🔥"
-    elif ap == 2 and rj==0: label, emoji, conf = "أغلبية موافقة",      "🟢", "عالية 🔥"
-    elif ap == 2 and rj==1: label, emoji, conf = "موافقة مع تحفظ",    "🟡", "متوسطة 💧"
-    elif rj == 3:           label, emoji, conf = "إجماع على الرفض",   "🔴", "رفض مؤكد ❄️"
-    elif rj >= 2:           label, emoji, conf = "أغلبية رافضة",       "🔴", "منخفضة ❄️"
-    else:                   label, emoji, conf = "محايد — انتظار",     "🟡", "منخفضة 💧"
+    if   ap == 3:           label, emoji, conf = "إجماع على الدخول",  "🟢", "عالية جداً 🔥🔥"
+    elif ap == 2 and rj==0: label, emoji, conf = "أغلبية موافقة",     "🟢", "عالية 🔥"
+    elif ap == 2 and rj==1: label, emoji, conf = "موافقة مع تحفظ",   "🟡", "متوسطة 💧"
+    elif rj == 3:           label, emoji, conf = "إجماع على الرفض",  "🔴", "رفض مؤكد ❄️"
+    elif rj >= 2:           label, emoji, conf = "أغلبية رافضة",      "🔴", "منخفضة ❄️"
+    else:                   label, emoji, conf = "محايد — انتظار",    "🟡", "منخفضة 💧"
 
     def ve(v): return "✅" if v=="approve" else ("❌" if v=="reject" else "⚠️")
-    votes_str = f"Claude {ve(votes['Claude'])}  Gemini {ve(votes['Gemini'])}  Grok {ve(votes['Grok'])}"
+    votes_str = (
+        f"Claude {ve(votes['Claude'])}  "
+        f"Gemini {ve(votes['Gemini'])}  "
+        f"Grok {ve(votes['Grok'])}"
+    )
 
     return {"label": label, "emoji": emoji, "confidence": conf, "votes": votes_str}
