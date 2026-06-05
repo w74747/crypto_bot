@@ -37,14 +37,14 @@ def calculate_rsi(closes: pd.Series, period: int = 14) -> float:
 class TradeOpportunity:
     symbol:            str
     current_price:     float
-    crash_pct_60d:     float   # نسبة الانهيار خلال 60 يوم
+    crash_pct_60d:     float
     lod_180:           float
     distance_from_lod: float
     rsi_daily:         float
     volume_24h_usd:    float
     nearest_support:   float
     github_active:     bool
-    signal_type:       str     # نوع الإشارة
+    signal_type:       str
 
     entry_price: float = field(init=False)
     stop_loss:   float = field(init=False)
@@ -73,27 +73,42 @@ class MarketScanner:
 
     def __init__(self):
         self.exchange = self._connect()
-        logger.info("✅ تم الاتصال بـ MEXC")
 
     def _connect(self) -> ccxt.mexc:
         exchange = ccxt.mexc({
             "apiKey": MEXC_API_KEY,
             "secret": MEXC_API_SECRET,
-            "options": {"defaultType": "spot"},
+            "options": {
+                "defaultType":    "spot",
+                "defaultNetwork": "spot",
+                "fetchMarkets":   ["spot"],
+            },
             "enableRateLimit": True,
+            "timeout":         30000,
         })
-        exchange.load_markets()
+        try:
+            exchange.load_markets()
+            logger.info(f"✅ تم الاتصال بـ MEXC — {len(exchange.markets)} سوق")
+        except Exception as e:
+            logger.error(f"❌ فشل تحميل الأسواق: {e}")
+            raise
         return exchange
 
     def get_usdt_symbols(self) -> list[str]:
-        symbols = [
-            s for s, m in self.exchange.markets.items()
-            if m.get("quote") == "USDT"
-            and m.get("active", False)
-            and m.get("spot", False)
-        ]
-        logger.info(f"📊 إجمالي أزواج USDT: {len(symbols)}")
-        return symbols
+        try:
+            symbols = [
+                s for s, m in self.exchange.markets.items()
+                if m.get("quote") == "USDT"
+                and m.get("active", False)
+                and m.get("spot", False)
+            ]
+            logger.info(f"📊 إجمالي أزواج USDT: {len(symbols)}")
+            if len(symbols) == 0:
+                logger.error("❌ لم يُعثر على أي زوج USDT — تحقق من مفاتيح MEXC API")
+            return symbols
+        except Exception as e:
+            logger.error(f"❌ خطأ في get_usdt_symbols: {e}")
+            return []
 
     def fetch_ohlcv_daily(self, symbol: str, limit: int = 200) -> Optional[pd.DataFrame]:
         try:
@@ -112,41 +127,24 @@ class MarketScanner:
             return None
 
     def calculate_indicators(self, df: pd.DataFrame) -> dict:
-        closes = df["close"]
+        closes        = df["close"]
         current_price = float(closes.iloc[-1])
-
-        # RSI
-        rsi = calculate_rsi(closes, period=RSI_PERIOD)
-
-        # أدنى سعر 180 يوم
-        lod_180  = float(df["low"].tail(LOD_DAYS).min())
-        distance = (current_price - lod_180) / lod_180 if lod_180 > 0 else 1.0
-
-        # أعلى سعر خلال 60 يوم (لحساب الانهيار الحديث)
-        high_60d    = float(df["close"].tail(60).max())
-        crash_60d   = (high_60d - current_price) / high_60d if high_60d > 0 else 0.0
-
-        # أعلى سعر خلال 30 يوم (للتحقق من استمرار الانهيار)
-        high_30d    = float(df["close"].tail(30).max())
-        crash_30d   = (high_30d - current_price) / high_30d if high_30d > 0 else 0.0
-
-        # فحص التماسك: هل آخر 3 شموع لا تصنع قيعاناً جديدة؟
+        rsi           = calculate_rsi(closes, period=RSI_PERIOD)
+        lod_180       = float(df["low"].tail(LOD_DAYS).min())
+        distance      = (current_price - lod_180) / lod_180 if lod_180 > 0 else 1.0
+        high_60d      = float(df["close"].tail(60).max())
+        crash_60d     = (high_60d - current_price) / high_60d if high_60d > 0 else 0.0
         last_3_lows   = df["low"].tail(3).values
         is_stabilizing = bool(last_3_lows[-1] >= last_3_lows[-2] * 0.98)
-
-        # أقرب دعم (أدنى قاع آخر 14 يوم)
         nearest_support = float(df["low"].tail(14).min())
-
         return {
-            "rsi":              rsi,
-            "lod_180":          lod_180,
-            "current_price":    current_price,
-            "distance":         distance,
-            "crash_60d":        crash_60d,
-            "crash_30d":        crash_30d,
-            "is_stabilizing":   is_stabilizing,
-            "nearest_support":  nearest_support,
-            "high_60d":         high_60d,
+            "rsi":             rsi,
+            "lod_180":         lod_180,
+            "current_price":   current_price,
+            "distance":        distance,
+            "crash_60d":       crash_60d,
+            "is_stabilizing":  is_stabilizing,
+            "nearest_support": nearest_support,
         }
 
     def get_24h_volume_usd(self, symbol: str) -> float:
@@ -159,56 +157,32 @@ class MarketScanner:
     def passes_filters(
         self, symbol: str, ind: dict, volume_usd: float
     ) -> tuple[bool, str]:
-        """
-        يطبق الفلاتر ويُعيد (نجح/فشل, سبب الفشل أو نوع الإشارة)
-
-        الاستراتيجيات الثلاث:
-        A — انهيار حديث + تماسك (الأفضل)
-        B — قريب من قاع 180 يوم + RSI تشبع بيعي (الكلاسيكي)
-        C — انهيار ضخم جداً + RSI منخفض جداً (الانتهازي)
-        """
-
-        # فلتر الحجم — إلزامي للجميع
         if volume_usd < MIN_DAILY_VOLUME_USD:
             return False, f"حجم منخفض ${volume_usd:,.0f}"
 
         rsi          = ind["rsi"]
         crash_60d    = ind["crash_60d"]
-        crash_30d    = ind["crash_30d"]
         distance     = ind["distance"]
         stabilizing  = ind["is_stabilizing"]
 
-        # --- استراتيجية A: انهيار حديث + تماسك ---
-        # انهارت أكثر من 40% خلال 60 يوم
-        # RSI أقل من 45
-        # بدأت تتماسك (لا قيعان جديدة)
+        # استراتيجية A: انهيار حديث + تماسك
         if crash_60d >= 0.40 and rsi < 45 and stabilizing:
             return True, f"🅰️ انهيار حديث {crash_60d:.0%} + تماسك"
 
-        # --- استراتيجية B: قريبة من القاع التاريخي ---
-        # السعر في نطاق 15% من قاع 180 يوم
-        # RSI في تشبع بيعي
+        # استراتيجية B: قريبة من القاع التاريخي
         if distance <= MAX_DISTANCE_FROM_LOD and rsi < RSI_OVERSOLD_THRESHOLD:
             return True, f"🅱️ قاع تاريخي RSI={rsi:.1f}"
 
-        # --- استراتيجية C: انهيار ضخم جداً ---
-        # انهارت أكثر من 60% خلال 60 يوم
-        # RSI أقل من 35 (تشبع بيعي حاد)
+        # استراتيجية C: انهيار ضخم جداً
         if crash_60d >= 0.60 and rsi < 35:
             return True, f"🅲 انهيار ضخم {crash_60d:.0%} RSI={rsi:.1f}"
 
-        return False, (
-            f"لم تجتز | crash60={crash_60d:.0%} "
-            f"RSI={rsi:.1f} dist={distance:.0%} "
-            f"stable={stabilizing}"
-        )
+        return False, f"لم تجتز | crash60={crash_60d:.0%} RSI={rsi:.1f} dist={distance:.0%}"
 
     def scan_market(self) -> list[TradeOpportunity]:
         logger.info("🔍 بدء فحص السوق — استراتيجية ثلاثية...")
-        opportunities  = []
-        symbols        = self.get_usdt_symbols()
-
-        # إحصائيات للتشخيص
+        opportunities = []
+        symbols       = self.get_usdt_symbols()
         stats = {"volume": 0, "strategy_a": 0, "strategy_b": 0, "strategy_c": 0}
 
         for i, symbol in enumerate(symbols, 1):
@@ -230,18 +204,14 @@ class MarketScanner:
                 stats["volume"] += 1
 
             passed, signal = self.passes_filters(symbol, ind, volume_usd)
-
             if not passed:
-                logger.debug(f"[Filter] {symbol}: {signal}")
                 continue
 
-            # فلتر GitHub
             coin = symbol.replace("/USDT", "")
             if not is_github_active(coin):
                 logger.info(f"[GitHub] {symbol}: مشروع غير نشط ❌")
                 continue
 
-            # تسجيل نوع الاستراتيجية
             if "🅰️" in signal: stats["strategy_a"] += 1
             elif "🅱️" in signal: stats["strategy_b"] += 1
             elif "🅲" in signal: stats["strategy_c"] += 1
@@ -267,7 +237,6 @@ class MarketScanner:
             )
             time.sleep(0.3)
 
-        # ملخص التشخيص
         logger.info(
             f"\n{'='*40}\n"
             f"📊 ملخص الفحص:\n"
