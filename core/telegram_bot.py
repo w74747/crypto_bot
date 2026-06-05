@@ -1,16 +1,12 @@
 """
 core/telegram_bot.py
 =====================
-بوت Telegram: يرسل التوصيات ويستقبل أوامر التنفيذ
+بوت Telegram مع نقاش الخبراء الثلاثي
+Claude + Gemini + Grok
 """
 
-from telegram import (
-    Bot, Update, InlineKeyboardButton,
-    InlineKeyboardMarkup
-)
-from telegram.ext import (
-    Application, CallbackQueryHandler, ContextTypes
-)
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
 from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from core.scanner import TradeOpportunity
@@ -18,224 +14,231 @@ from core.executor import TradeExecutor
 from utils.logger import logger
 
 
+# ==========================================
+# تنسيق رسالة الفرصة
+# ==========================================
 def format_opportunity_message(opp: TradeOpportunity) -> str:
-    """
-    ينسّق رسالة التوصية بتنسيق جميل لـ Telegram
-    """
-
-    def esc(text: str) -> str:
-        """يهرّب الأحرف الخاصة في MarkdownV2"""
-        special = r"_*[]()~`>#+-=|{}.!"
-        for ch in special:
-            text = text.replace(ch, f"\\{ch}")
-        return text
-
-    vol_m = opp.volume_24h_usd / 1_000_000
-
-    msg = (
-        f"🎯 *فرصة تداول جديدة\\!*\n\n"
-        f"🪙 *العملة:* `{esc(opp.symbol)}`\n"
+    vol_m  = opp.volume_24h_usd / 1_000_000
+    sl_pct = ((opp.entry_price - opp.stop_loss) / opp.entry_price) * 100
+    return (
+        f"🎯 <b>فرصة تداول جديدة!</b>\n\n"
+        f"🪙 <b>العملة:</b> <code>{opp.symbol}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 *التحليل الفني:*\n"
-        f"  • RSI اليومي: `{esc(f'{opp.rsi_daily:.1f}')}`  ⬇️ تشبع بيعي\n"
-        f"  • الانهيار خلال 60 يوم: `{esc(f'{opp.crash_pct_60d:.0%}')}`  🔻\n"
-        f"  • البعد عن القاع 180 يوم: `{esc(f'{opp.distance_from_lod:.1%}')}`\n"
-        f"  • نوع الإشارة: `{esc(opp.signal_type)}`\n"
-        f"  • حجم التداول: `{esc(f'${vol_m:.1f}M')}`\n\n"
-        f"💰 *تفاصيل الصفقة:*\n"
-        f"  • سعر الدخول: `{esc(f'{opp.entry_price:.6f}')}`\n"
-        f"  • وقف الخسارة: `{esc(f'{opp.stop_loss:.6f}')}` "
-        f"\\(\\-{esc(f'{((opp.entry_price - opp.stop_loss)/opp.entry_price)*100:.1f}')}%\\)\n\n"
-        f"🎯 *الأهداف:*\n"
-        f"  • TP1 \\(30%\\): `{esc(f'{opp.tp1:.6f}')}`  →  40% من الكمية\n"
-        f"  • TP2 \\(60%\\): `{esc(f'{opp.tp2:.6f}')}`  →  35% من الكمية\n"
-        f"  • TP3 \\(100%\\): `{esc(f'{opp.tp3:.6f}')}`  →  25% من الكمية\n\n"
-        f"📐 *نسبة المخاطرة/العائد:* `1:{esc(str(opp.risk_reward_ratio))}`\n"
+        f"📊 <b>التحليل الفني:</b>\n"
+        f"  • RSI اليومي: <code>{opp.rsi_daily:.1f}</code> ⬇️\n"
+        f"  • الانهيار 60 يوم: <code>{opp.crash_pct_60d:.0%}</code> 🔻\n"
+        f"  • البعد عن القاع: <code>{opp.distance_from_lod:.1%}</code>\n"
+        f"  • نوع الإشارة: <code>{opp.signal_type}</code>\n"
+        f"  • حجم التداول: <code>${vol_m:.1f}M</code>\n\n"
+        f"💰 <b>تفاصيل الصفقة:</b>\n"
+        f"  • سعر الدخول: <code>{opp.entry_price:.6f}</code>\n"
+        f"  • وقف الخسارة: <code>{opp.stop_loss:.6f}</code> (-{sl_pct:.1f}%)\n\n"
+        f"🎯 <b>الأهداف:</b>\n"
+        f"  • TP1 (30%): <code>{opp.tp1:.6f}</code>  → 40%\n"
+        f"  • TP2 (60%): <code>{opp.tp2:.6f}</code>  → 35%\n"
+        f"  • TP3 (100%): <code>{opp.tp3:.6f}</code> → 25%\n\n"
+        f"📐 <b>نسبة R/R:</b> <code>1:{opp.risk_reward_ratio}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⚡ هل تريد تنفيذ هذه الصفقة؟"
     )
-    return msg
 
 
-def create_opportunity_keyboard(symbol: str) -> InlineKeyboardMarkup:
-    """
-    يُنشئ الأزرار التفاعلية تحت رسالة التوصية
-    """
-    clean_symbol = symbol.replace("/", "_")
+# ==========================================
+# تنسيق رسالة النقاش
+# ==========================================
+def format_debate_message(result: dict) -> str:
+    rec    = result["recommendation"]
+    log    = result["debate_log"]
+    symbol = result["symbol"]
 
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "✅ موافقة وتنفيذ",
-                callback_data=f"execute:{clean_symbol}"
-            ),
-            InlineKeyboardButton(
-                "❌ تجاهل",
-                callback_data=f"ignore:{clean_symbol}"
-            ),
+    def trim(text: str, n: int = 220) -> str:
+        return text[:n] + "..." if len(text) > n else text
+
+    rounds = {f"{e['speaker']}_{e['round']}": e["text"] for e in log}
+
+    return (
+        f"🧠 <b>نقاش الخبراء — {symbol}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"<b>🔵 الجولة الأولى — التحليل المستقل:</b>\n\n"
+        f"<b>🤖 Claude (فني):</b>\n<i>{trim(rounds.get('Claude_1','—'))}</i>\n\n"
+        f"<b>♊ Gemini (مخاطر):</b>\n<i>{trim(rounds.get('Gemini_1','—'))}</i>\n\n"
+        f"<b>𝕏 Grok (مجتمع X):</b>\n<i>{trim(rounds.get('Grok_1','—'))}</i>\n\n"
+        f"─────────────────\n\n"
+
+        f"<b>🟣 الجولة الثانية — الرد والنقاش:</b>\n\n"
+        f"<b>🤖 Claude:</b>\n<i>{trim(rounds.get('Claude_2','—'))}</i>\n\n"
+        f"<b>♊ Gemini:</b>\n<i>{trim(rounds.get('Gemini_2','—'))}</i>\n\n"
+        f"<b>𝕏 Grok:</b>\n<i>{trim(rounds.get('Grok_2','—'))}</i>\n\n"
+        f"─────────────────\n\n"
+
+        f"<b>🟠 الجولة الثالثة — الحكم النهائي:</b>\n\n"
+        f"<b>🤖 Claude:</b>\n<i>{trim(rounds.get('Claude_3','—'))}</i>\n\n"
+        f"<b>♊ Gemini:</b>\n<i>{trim(rounds.get('Gemini_3','—'))}</i>\n\n"
+        f"<b>𝕏 Grok:</b>\n<i>{trim(rounds.get('Grok_3','—'))}</i>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>تصويت الخبراء:</b>\n{rec['votes']}\n\n"
+        f"<b>النتيجة:</b> {rec['emoji']} <b>{rec['label']}</b>\n"
+        f"<b>درجة الثقة:</b> {rec['confidence']}"
+    )
+
+
+# ==========================================
+# الأزرار التفاعلية
+# ==========================================
+def create_keyboard(symbol: str, debate_done: bool = False) -> InlineKeyboardMarkup:
+    clean = symbol.replace("/", "_")
+    if not debate_done:
+        keyboard = [
+            [InlineKeyboardButton(
+                "🧠 نقاش الخبراء (Claude + Gemini + Grok)",
+                callback_data=f"debate:{clean}"
+            )],
+            [
+                InlineKeyboardButton("✅ موافقة وتنفيذ", callback_data=f"execute:{clean}"),
+                InlineKeyboardButton("❌ تجاهل",         callback_data=f"ignore:{clean}"),
+            ],
         ]
-    ]
+    else:
+        keyboard = [[
+            InlineKeyboardButton("✅ موافقة وتنفيذ", callback_data=f"execute:{clean}"),
+            InlineKeyboardButton("❌ تجاهل",         callback_data=f"ignore:{clean}"),
+        ]]
     return InlineKeyboardMarkup(keyboard)
 
 
+# ==========================================
+# TelegramNotifier
+# ==========================================
 class TelegramNotifier:
-    """
-    يرسل الرسائل والإشعارات لـ Telegram
-    """
 
     def __init__(self):
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-    async def send_opportunity(self, opportunity: TradeOpportunity) -> int:
-        """
-        يرسل رسالة فرصة التداول مع الأزرار التفاعلية
-        """
-        message  = format_opportunity_message(opportunity)
-        keyboard = create_opportunity_keyboard(opportunity.symbol)
-
+    async def send_opportunity(self, opp: TradeOpportunity) -> int:
         sent = await self.bot.send_message(
             chat_id      = TELEGRAM_CHAT_ID,
-            text         = message,
-            parse_mode   = "MarkdownV2",
-            reply_markup = keyboard,
+            text         = format_opportunity_message(opp),
+            parse_mode   = "HTML",
+            reply_markup = create_keyboard(opp.symbol, debate_done=False),
         )
-
-        logger.info(f"[Telegram] تم إرسال توصية {opportunity.symbol} | ID: {sent.message_id}")
+        logger.info(f"[Telegram] توصية {opp.symbol} | ID: {sent.message_id}")
         return sent.message_id
 
-    async def send_execution_result(self, result: dict):
-        """يرسل نتيجة تنفيذ الصفقة"""
-        symbol = result.get("symbol", "؟")
+    async def send_debate_result(self, result: dict, reply_to_id: int):
+        await self.bot.send_message(
+            chat_id             = TELEGRAM_CHAT_ID,
+            text                = format_debate_message(result),
+            parse_mode          = "HTML",
+            reply_to_message_id = reply_to_id,
+        )
+        # إزالة زر النقاش من الرسالة الأصلية
+        try:
+            await self.bot.edit_message_reply_markup(
+                chat_id      = TELEGRAM_CHAT_ID,
+                message_id   = reply_to_id,
+                reply_markup = create_keyboard(result["symbol"], debate_done=True),
+            )
+        except Exception:
+            pass
 
+    async def send_execution_result(self, result: dict):
+        symbol = result.get("symbol", "؟")
         if result.get("success"):
             text = (
-                f"✅ *تم تنفيذ الصفقة بنجاح\\!*\n\n"
-                f"🪙 العملة: `{symbol}`\n"
-                f"💵 سعر الشراء: `{result['filled_price']:.6f}`\n"
-                f"📦 الكمية: `{result['filled_qty']}`\n\n"
-                f"🎯 *أوامر البيع موضوعة:*\n"
-                f"  TP1: `{result.get('tp1', 0):.6f}`\n"
-                f"  TP2: `{result.get('tp2', 0):.6f}`\n"
-                f"  TP3: `{result.get('tp3', 0):.6f}`\n"
-                f"  SL:  `{result.get('sl', 0):.6f}`\n\n"
-                f"🛡️ الصفقة محمية ووقف الخسارة نشط"
-            )
-        else:
-            error = result.get("error", "خطأ غير معروف")
-            text = (
-                f"❌ *فشل تنفيذ الصفقة\\!*\n\n"
-                f"🪙 العملة: `{symbol}`\n"
-                f"⚠️ السبب: {error}"
-            )
-
-        # هرّب الأحرف الخاصة
-        special = r"_[]()~`>#+-=|{}.!"
-        for ch in special:
-            text = text.replace(ch, f"\\{ch}")
-
-        await self.bot.send_message(
-            chat_id    = TELEGRAM_CHAT_ID,
-            text       = text,
-            parse_mode = "MarkdownV2",
-        )
-
-    async def send_scan_summary(self, opportunities_count: int, symbols_count: int):
-        """يرسل ملخص نتيجة الفحص"""
-        if opportunities_count == 0:
-            text = (
-                f"🔍 اكتمل الفحص \\- لا توجد فرص حالياً\n"
-                f"📊 فُحص `{symbols_count}` عملة\n"
-                f"⏰ الفحص القادم بعد 60 دقيقة"
+                f"✅ <b>تم تنفيذ الصفقة بنجاح!</b>\n\n"
+                f"🪙 العملة: <code>{symbol}</code>\n"
+                f"💵 سعر الشراء: <code>{result['filled_price']:.6f}</code>\n"
+                f"📦 الكمية: <code>{result['filled_qty']}</code>\n\n"
+                f"🎯 <b>أوامر البيع:</b>\n"
+                f"  TP1: <code>{result.get('tp1',0):.6f}</code>\n"
+                f"  TP2: <code>{result.get('tp2',0):.6f}</code>\n"
+                f"  TP3: <code>{result.get('tp3',0):.6f}</code>\n"
+                f"  SL:  <code>{result.get('sl',0):.6f}</code>\n\n"
+                f"🛡️ وقف الخسارة نشط"
             )
         else:
             text = (
-                f"✅ اكتمل الفحص\n"
-                f"💎 وُجد `{opportunities_count}` فرصة من `{symbols_count}` عملة\n"
-                f"⬆️ راجع التوصيات أعلاه"
+                f"❌ <b>فشل التنفيذ!</b>\n\n"
+                f"🪙 {symbol}\n"
+                f"⚠️ {result.get('error','خطأ غير معروف')}"
             )
-
         await self.bot.send_message(
-            chat_id    = TELEGRAM_CHAT_ID,
-            text       = text,
-            parse_mode = "MarkdownV2",
+            chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML"
         )
 
     async def send_plain_message(self, text: str):
-        """يرسل رسالة نصية بسيطة"""
-        await self.bot.send_message(
-            chat_id = TELEGRAM_CHAT_ID,
-            text    = text,
-        )
-        logger.info(f"[Telegram] رسالة: {text[:50]}...")
+        await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
 
 # ==========================================
-# معالج الأزرار التفاعلية
+# معالج الأزرار
 # ==========================================
-
-_pending_opportunities: dict[str, TradeOpportunity] = {}
+_pending: dict[str, TradeOpportunity] = {}
+_msg_ids: dict[str, int]              = {}
 _executor = None
 
 
-def register_opportunity(opportunity: TradeOpportunity):
-    """يسجل فرصة في انتظار قرار المستخدم"""
-    clean = opportunity.symbol.replace("/", "_")
-    _pending_opportunities[clean] = opportunity
-    logger.info(f"[Telegram] فرصة {opportunity.symbol} في انتظار القرار")
+def register_opportunity(opp: TradeOpportunity, msg_id: int = 0):
+    clean = opp.symbol.replace("/", "_")
+    _pending[clean] = opp
+    _msg_ids[clean] = msg_id
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    يعالج ضغطة الزر من المستخدم
-    execute → ينفذ الصفقة
-    ignore  → يتجاهل التوصية
-    """
     global _executor
-
     query          = update.callback_query
-    data           = query.data
-    action, symbol = data.split(":", 1)
-
+    action, symbol = query.data.split(":", 1)
     await query.answer()
 
+    opp    = _pending.get(symbol)
+    msg_id = _msg_ids.get(symbol, query.message.message_id)
+
+    # تجاهل
     if action == "ignore":
         await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(
-            f"⏭️ تم تجاهل توصية {symbol.replace('_', '/')}"
-        )
-        _pending_opportunities.pop(symbol, None)
+        await query.message.reply_text(f"⏭️ تم تجاهل {symbol.replace('_','/')}")
+        _pending.pop(symbol, None)
         return
 
-    if action == "execute":
-        opportunity = _pending_opportunities.get(symbol)
-
-        if not opportunity:
-            await query.message.reply_text("⚠️ انتهت صلاحية هذه التوصية")
+    # نقاش الخبراء
+    if action == "debate":
+        if not opp:
+            await query.message.reply_text("⚠️ انتهت صلاحية التوصية")
             return
-
-        # إزالة الأزرار لمنع الضغط المزدوج
-        await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text(
-            f"⏳ جاري تنفيذ صفقة {opportunity.symbol}..."
+            f"🧠 جاري تشغيل نقاش الخبراء الثلاثي...\n"
+            f"🤖 Claude + ♊ Gemini + 𝕏 Grok\n"
+            f"⏳ يستغرق 45-90 ثانية"
         )
+        try:
+            from core.ai_analyst import run_expert_debate
+            result   = run_expert_debate(opp)
+            notifier = TelegramNotifier()
+            await notifier.send_debate_result(result, msg_id)
+        except Exception as e:
+            logger.error(f"[Debate] خطأ: {e}")
+            await query.message.reply_text(f"⚠️ خطأ في النقاش: {str(e)[:100]}")
+        return
 
+    # تنفيذ
+    if action == "execute":
+        if not opp:
+            await query.message.reply_text("⚠️ انتهت صلاحية التوصية")
+            return
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(f"⏳ جاري تنفيذ صفقة {opp.symbol}...")
         if _executor is None:
             _executor = TradeExecutor()
-
-        result = _executor.execute_full_trade(opportunity)
-
+        result   = _executor.execute_full_trade(opp)
         notifier = TelegramNotifier()
         await notifier.send_execution_result(result)
-
-        _pending_opportunities.pop(symbol, None)
+        _pending.pop(symbol, None)
 
 
 def build_application() -> Application:
-    """يبني تطبيق Telegram ويسجل المعالجات"""
     global _executor
     _executor = TradeExecutor()
-
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(handle_callback))
-
     return app
