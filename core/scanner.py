@@ -19,6 +19,20 @@ from utils.logger import logger
 from utils.github_checker import is_github_active
 
 
+# عملات يجب استبعادها — فيات أو stablecoins أو لا معنى لتداولها
+EXCLUDED_BASE_COINS = {
+    # Stablecoins
+    "USDC", "BUSD", "TUSD", "USDP", "GUSD", "FRAX", "LUSD",
+    "DAI", "USDD", "FDUSD", "PYUSD", "USDE", "SUSD",
+    # عملات فيات
+    "EUR", "GBP", "AUD", "JPY", "TRY", "BRL", "CAD",
+    # Wrapped tokens
+    "WBTC", "WETH", "WBNB", "WMATIC", "WSOL",
+    # Liquid staking
+    "STETH", "RETH", "CBETH", "SFRXETH",
+}
+
+
 def calculate_rsi(closes: pd.Series, period: int = 14) -> float:
     delta    = closes.diff()
     gain     = delta.clip(lower=0)
@@ -92,13 +106,27 @@ class MarketScanner:
 
     def get_usdt_symbols(self) -> list[str]:
         try:
-            symbols = [
-                s for s, m in self.exchange.markets.items()
-                if m.get("quote") == "USDT"
-                and m.get("type", "") == "spot"
-                and m.get("info", {}).get("isSpotTradingAllowed") == True
-            ]
-            logger.info(f"📊 إجمالي أزواج USDT: {len(symbols)}")
+            symbols = []
+            excluded = 0
+            for s, m in self.exchange.markets.items():
+                # يجب أن يكون زوج USDT من نوع spot
+                if m.get("quote") != "USDT":
+                    continue
+                if m.get("type", "") != "spot":
+                    continue
+                if not m.get("info", {}).get("isSpotTradingAllowed"):
+                    continue
+                # استبعاد Stablecoins والفيات
+                base = m.get("base", "")
+                if base in EXCLUDED_BASE_COINS:
+                    excluded += 1
+                    continue
+                symbols.append(s)
+
+            logger.info(
+                f"📊 إجمالي أزواج USDT: {len(symbols)} "
+                f"(تم استبعاد {excluded} stablecoin/فيات)"
+            )
             return symbols
         except Exception as e:
             logger.error(f"❌ خطأ في get_usdt_symbols: {e}")
