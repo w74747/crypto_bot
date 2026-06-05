@@ -1,12 +1,15 @@
 """
 core/scanner.py
+===============
+Bottom Fisher — نظام المجموعات (Batching)
+يفحص العملات على دفعات ويرسل الفرص فور اكتشافها
 """
 
 import ccxt
 import pandas as pd
 import numpy as np
 import time
-from typing import Optional
+from typing import Optional, AsyncGenerator
 from dataclasses import dataclass, field
 
 from config.settings import (
@@ -18,18 +21,17 @@ from config.settings import (
 from utils.logger import logger
 from utils.github_checker import is_github_active
 
+# حجم كل مجموعة
+BATCH_SIZE = int(__import__('os').getenv("BATCH_SIZE", "100"))
 
-# عملات يجب استبعادها — فيات أو stablecoins أو لا معنى لتداولها
+# عملات مستبعدة
 EXCLUDED_BASE_COINS = {
-    # Stablecoins
-    "USDC", "BUSD", "TUSD", "USDP", "GUSD", "FRAX", "LUSD",
-    "DAI", "USDD", "FDUSD", "PYUSD", "USDE", "SUSD",
-    # عملات فيات
-    "EUR", "GBP", "AUD", "JPY", "TRY", "BRL", "CAD",
-    # Wrapped tokens
-    "WBTC", "WETH", "WBNB", "WMATIC", "WSOL",
-    # Liquid staking
-    "STETH", "RETH", "CBETH", "SFRXETH",
+    "USDC","BUSD","TUSD","USDP","GUSD","FRAX","LUSD",
+    "DAI","USDD","FDUSD","PYUSD","USDE","SUSD","USD1",
+    "USDT","AEUR","EURI","EURS","XAUT","PAXG",
+    "EUR","GBP","AUD","JPY","TRY","BRL","CAD",
+    "WBTC","WETH","WBNB","WMATIC","WSOL",
+    "STETH","RETH","CBETH","SFRXETH",
 }
 
 
@@ -106,30 +108,26 @@ class MarketScanner:
 
     def get_usdt_symbols(self) -> list[str]:
         try:
-            symbols = []
+            symbols  = []
             excluded = 0
             for s, m in self.exchange.markets.items():
-                # يجب أن يكون زوج USDT من نوع spot
                 if m.get("quote") != "USDT":
                     continue
                 if m.get("type", "") != "spot":
                     continue
                 if not m.get("info", {}).get("isSpotTradingAllowed"):
                     continue
-                # استبعاد Stablecoins والفيات
-                base = m.get("base", "")
-                if base in EXCLUDED_BASE_COINS:
+                if m.get("base", "") in EXCLUDED_BASE_COINS:
                     excluded += 1
                     continue
                 symbols.append(s)
-
             logger.info(
                 f"📊 إجمالي أزواج USDT: {len(symbols)} "
-                f"(تم استبعاد {excluded} stablecoin/فيات)"
+                f"(استُبعد {excluded} stablecoin/فيات)"
             )
             return symbols
         except Exception as e:
-            logger.error(f"❌ خطأ في get_usdt_symbols: {e}")
+            logger.error(f"❌ خطأ: {e}")
             return []
 
     def fetch_ohlcv_daily(self, symbol: str, limit: int = 200) -> Optional[pd.DataFrame]:
@@ -176,11 +174,9 @@ class MarketScanner:
         except Exception:
             return 0.0
 
-    def passes_filters(
-        self, symbol: str, ind: dict, volume_usd: float
-    ) -> tuple[bool, str]:
+    def passes_filters(self, symbol: str, ind: dict, volume_usd: float) -> tuple[bool, str]:
         if volume_usd < MIN_DAILY_VOLUME_USD:
-            return False, f"حجم منخفض ${volume_usd:,.0f}"
+            return False, f"حجم منخفض"
 
         rsi         = ind["rsi"]
         crash_60d   = ind["crash_60d"]
@@ -189,82 +185,119 @@ class MarketScanner:
 
         if crash_60d >= 0.40 and rsi < 45 and stabilizing:
             return True, f"🅰️ انهيار حديث {crash_60d:.0%} + تماسك"
-
         if distance <= MAX_DISTANCE_FROM_LOD and rsi < RSI_OVERSOLD_THRESHOLD:
             return True, f"🅱️ قاع تاريخي RSI={rsi:.1f}"
-
         if crash_60d >= 0.60 and rsi < 35:
             return True, f"🅲 انهيار ضخم {crash_60d:.0%} RSI={rsi:.1f}"
 
-        return False, f"لم تجتز | crash60={crash_60d:.0%} RSI={rsi:.1f} dist={distance:.0%}"
+        return False, ""
 
-    def scan_market(self) -> list[TradeOpportunity]:
-        logger.info("🔍 بدء فحص السوق — استراتيجية ثلاثية...")
-        opportunities = []
-        symbols       = self.get_usdt_symbols()
-        stats = {"volume": 0, "strategy_a": 0, "strategy_b": 0, "strategy_c": 0}
+    def _process_symbol(self, symbol: str) -> Optional["TradeOpportunity"]:
+        """يعالج عملة واحدة ويُعيد الفرصة إن وُجدت"""
+        df = self.fetch_ohlcv_daily(symbol)
+        if df is None:
+            return None
+        try:
+            ind = self.calculate_indicators(df)
+        except Exception:
+            return None
 
-        for i, symbol in enumerate(symbols, 1):
-            if i % 50 == 0:
-                logger.info(f"[Scan] {i}/{len(symbols)} | فرص: {len(opportunities)}")
+        volume_usd       = self.get_24h_volume_usd(symbol)
+        passed, signal   = self.passes_filters(symbol, ind, volume_usd)
+        if not passed:
+            return None
 
-            df = self.fetch_ohlcv_daily(symbol)
-            if df is None:
-                continue
+        # فلتر GitHub الذكي
+        coin = symbol.replace("/USDT", "")
+        if not is_github_active(coin):
+            logger.info(f"[GitHub] {symbol}: مشروع غير نشط ❌")
+            return None
 
-            try:
-                ind = self.calculate_indicators(df)
-            except Exception as e:
-                logger.warning(f"[Scan] فشل {symbol}: {e}")
-                continue
+        return TradeOpportunity(
+            symbol            = symbol,
+            current_price     = ind["current_price"],
+            crash_pct_60d     = ind["crash_60d"],
+            lod_180           = ind["lod_180"],
+            distance_from_lod = ind["distance"],
+            rsi_daily         = ind["rsi"],
+            volume_24h_usd    = volume_usd,
+            nearest_support   = ind["nearest_support"],
+            github_active     = True,
+            signal_type       = signal,
+        )
 
-            volume_usd = self.get_24h_volume_usd(symbol)
-            if volume_usd >= MIN_DAILY_VOLUME_USD:
-                stats["volume"] += 1
-
-            passed, signal = self.passes_filters(symbol, ind, volume_usd)
-            if not passed:
-                continue
-
-            coin = symbol.replace("/USDT", "")
-            if not is_github_active(coin):
-                logger.info(f"[GitHub] {symbol}: مشروع غير نشط ❌")
-                continue
-
-            if "🅰️" in signal:   stats["strategy_a"] += 1
-            elif "🅱️" in signal: stats["strategy_b"] += 1
-            elif "🅲" in signal:  stats["strategy_c"] += 1
-
-            opp = TradeOpportunity(
-                symbol            = symbol,
-                current_price     = ind["current_price"],
-                crash_pct_60d     = ind["crash_60d"],
-                lod_180           = ind["lod_180"],
-                distance_from_lod = ind["distance"],
-                rsi_daily         = ind["rsi"],
-                volume_24h_usd    = volume_usd,
-                nearest_support   = ind["nearest_support"],
-                github_active     = True,
-                signal_type       = signal,
-            )
-            opportunities.append(opp)
-            logger.info(
-                f"💎 {symbol} | {signal} "
-                f"| دخول: {opp.entry_price:.6f} "
-                f"| SL: {opp.stop_loss:.6f} "
-                f"| R/R: {opp.risk_reward_ratio}"
-            )
-            time.sleep(0.3)
+    def scan_market_batched(self, batch_size: int = BATCH_SIZE):
+        """
+        Generator يفحص العملات على مجموعات
+        يُعيد (قائمة الفرص, رقم المجموعة, إجمالي المجموعات)
+        بعد كل مجموعة مكتملة
+        """
+        symbols      = self.get_usdt_symbols()
+        total        = len(symbols)
+        total_batches = (total + batch_size - 1) // batch_size
+        all_opps     = []
+        total_stats  = {"a": 0, "b": 0, "c": 0}
 
         logger.info(
+            f"🔍 بدء الفحص — {total} عملة "
+            f"في {total_batches} مجموعة "
+            f"({batch_size} عملة/مجموعة)"
+        )
+
+        for batch_num in range(total_batches):
+            start      = batch_num * batch_size
+            end        = min(start + batch_size, total)
+            batch      = symbols[start:end]
+            batch_opps = []
+
+            logger.info(
+                f"\n{'─'*35}\n"
+                f"📦 المجموعة {batch_num+1}/{total_batches} "
+                f"| العملات {start+1}–{end}\n"
+                f"{'─'*35}"
+            )
+
+            for symbol in batch:
+                opp = self._process_symbol(symbol)
+                if opp:
+                    batch_opps.append(opp)
+                    all_opps.append(opp)
+                    if "🅰️" in opp.signal_type: total_stats["a"] += 1
+                    elif "🅱️" in opp.signal_type: total_stats["b"] += 1
+                    elif "🅲" in opp.signal_type: total_stats["c"] += 1
+                    logger.info(
+                        f"💎 {symbol} | {opp.signal_type} "
+                        f"| دخول: {opp.entry_price:.6f} "
+                        f"| R/R: {opp.risk_reward_ratio}"
+                    )
+                time.sleep(0.2)
+
+            # ملخص المجموعة في الـ logs فقط
+            logger.info(
+                f"✅ المجموعة {batch_num+1} اكتملت: "
+                f"{len(batch_opps)} فرصة | "
+                f"إجمالي حتى الآن: {len(all_opps)}"
+            )
+
+            # أعطِ الفرص للـ main ليرسلها فوراً
+            yield batch_opps, batch_num + 1, total_batches
+
+        # ملخص نهائي
+        logger.info(
             f"\n{'='*40}\n"
-            f"📊 ملخص الفحص:\n"
-            f"  إجمالي العملات:      {len(symbols)}\n"
-            f"  اجتازت فلتر الحجم:  {stats['volume']}\n"
-            f"  استراتيجية A:        {stats['strategy_a']}\n"
-            f"  استراتيجية B:        {stats['strategy_b']}\n"
-            f"  استراتيجية C:        {stats['strategy_c']}\n"
-            f"  إجمالي الفرص:        {len(opportunities)}\n"
+            f"📊 الفحص الكامل اكتمل:\n"
+            f"  إجمالي العملات:   {total}\n"
+            f"  استراتيجية A:     {total_stats['a']}\n"
+            f"  استراتيجية B:     {total_stats['b']}\n"
+            f"  استراتيجية C:     {total_stats['c']}\n"
+            f"  إجمالي الفرص:     {len(all_opps)}\n"
             f"{'='*40}"
         )
-        return opportunities
+        return all_opps
+
+    def scan_market(self) -> list[TradeOpportunity]:
+        """للتوافق مع الكود القديم — يجمع كل النتائج"""
+        all_opps = []
+        for batch_opps, _, _ in self.scan_market_batched():
+            all_opps.extend(batch_opps)
+        return all_opps
