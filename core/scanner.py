@@ -76,9 +76,8 @@ class MarketScanner:
             "apiKey": MEXC_API_KEY,
             "secret": MEXC_API_SECRET,
             "options": {
-                "defaultType":    "spot",
-                "defaultNetwork": "spot",
-                "fetchMarkets":   ["spot"],
+                "defaultType":  "spot",
+                "fetchMarkets": ["spot"],
             },
             "enableRateLimit": True,
             "timeout":         30000,
@@ -96,13 +95,10 @@ class MarketScanner:
             symbols = [
                 s for s, m in self.exchange.markets.items()
                 if m.get("quote") == "USDT"
-                and m.get("active", False)
                 and m.get("type", "") == "spot"
+                and m.get("info", {}).get("isSpotTradingAllowed") == True
             ]
             logger.info(f"📊 إجمالي أزواج USDT: {len(symbols)}")
-            if len(symbols) == 0:
-                first = list(self.exchange.markets.items())[:1]
-                logger.error(f"❌ نموذج بيانات السوق: {first}")
             return symbols
         except Exception as e:
             logger.error(f"❌ خطأ في get_usdt_symbols: {e}")
