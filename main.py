@@ -1,6 +1,5 @@
 """
-main.py — نظام المجموعات
-يرسل الفرص فور اكتمال كل مجموعة
+main.py — نظام المجموعات مع نقاش تلقائي
 """
 
 import asyncio
@@ -11,6 +10,10 @@ from core.scanner import MarketScanner
 from core.telegram_bot import TelegramNotifier, register_opportunity, build_application
 from utils.logger import logger
 
+# هل يعمل النقاش تلقائياً مع كل فرصة؟
+import os
+AUTO_DEBATE = os.getenv("AUTO_DEBATE", "true").lower() == "true"
+
 
 async def scanner_loop(notifier: TelegramNotifier):
     scanner          = MarketScanner()
@@ -18,41 +21,44 @@ async def scanner_loop(notifier: TelegramNotifier):
 
     await notifier.send_plain_message(
         f"🤖 البوت يعمل | فحص كل {SCAN_INTERVAL_MINUTES} دقيقة\n"
-        f"📦 النظام يرسل الفرص فور اكتمال كل مجموعة\n"
-        f"🧠 GitHub AI: Grok + Gemini"
+        f"📦 يرسل الفرص فور اكتمال كل مجموعة\n"
+        f"🧠 نقاش الخبراء {'تلقائي' if AUTO_DEBATE else 'عند الطلب'}"
     )
 
     while True:
         start_time = datetime.now()
         logger.info(f"🔄 دورة جديدة: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-
         total_sent = 0
 
         try:
-            # فحص بالمجموعات — يرسل الفرص فور اكتمال كل مجموعة
             for batch_opps, batch_num, total_batches in scanner.scan_market_batched():
+                for opp in batch_opps:
+                    try:
+                        if AUTO_DEBATE:
+                            # نقاش تلقائي — يُدمج في الرسالة
+                            msg_id = await notifier.send_opportunity_with_debate(opp)
+                        else:
+                            # رسالة عادية مع زر النقاش
+                            msg_id = await notifier.send_opportunity(opp)
 
-                if batch_opps:
-                    for opp in batch_opps:
-                        msg_id = await notifier.send_opportunity(opp)
                         register_opportunity(opp, msg_id)
                         total_sent += 1
-                        await asyncio.sleep(0.5)
+                        # تأخير بين الرسائل لتجنب Flood Control
+                        await asyncio.sleep(4)
 
-                # تأخير بسيط بين المجموعات لتجنب Rate Limiting
+                    except Exception as e:
+                        logger.error(f"[Send] خطأ في إرسال {opp.symbol}: {e}")
+                        await asyncio.sleep(10)
+
                 if batch_num < total_batches:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(3)
 
         except Exception as e:
             logger.error(f"❌ خطأ في الفحص: {e}", exc_info=True)
             await notifier.send_plain_message(f"⚠️ خطأ: {str(e)[:100]}")
 
         elapsed = (datetime.now() - start_time).seconds // 60
-        logger.info(
-            f"✅ الدورة اكتملت خلال {elapsed} دقيقة "
-            f"| أُرسلت {total_sent} فرصة"
-        )
-
+        logger.info(f"✅ الدورة اكتملت خلال {elapsed} دقيقة | أُرسلت {total_sent} فرصة")
         logger.info(f"⏳ الانتظار {SCAN_INTERVAL_MINUTES} دقيقة...")
         await asyncio.sleep(interval_seconds)
 
