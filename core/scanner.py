@@ -1,8 +1,5 @@
 """
 core/scanner.py
-===============
-Bottom Fisher - نسخة محسّنة
-تبحث عن انهيارات حديثة مع بداية تماسك
 """
 
 import ccxt
@@ -100,11 +97,12 @@ class MarketScanner:
                 s for s, m in self.exchange.markets.items()
                 if m.get("quote") == "USDT"
                 and m.get("active", False)
-                and m.get("spot", False)
+                and m.get("type", "") == "spot"
             ]
             logger.info(f"📊 إجمالي أزواج USDT: {len(symbols)}")
             if len(symbols) == 0:
-                logger.error("❌ لم يُعثر على أي زوج USDT — تحقق من مفاتيح MEXC API")
+                first = list(self.exchange.markets.items())[:1]
+                logger.error(f"❌ نموذج بيانات السوق: {first}")
             return symbols
         except Exception as e:
             logger.error(f"❌ خطأ في get_usdt_symbols: {e}")
@@ -127,15 +125,15 @@ class MarketScanner:
             return None
 
     def calculate_indicators(self, df: pd.DataFrame) -> dict:
-        closes        = df["close"]
-        current_price = float(closes.iloc[-1])
-        rsi           = calculate_rsi(closes, period=RSI_PERIOD)
-        lod_180       = float(df["low"].tail(LOD_DAYS).min())
-        distance      = (current_price - lod_180) / lod_180 if lod_180 > 0 else 1.0
-        high_60d      = float(df["close"].tail(60).max())
-        crash_60d     = (high_60d - current_price) / high_60d if high_60d > 0 else 0.0
-        last_3_lows   = df["low"].tail(3).values
-        is_stabilizing = bool(last_3_lows[-1] >= last_3_lows[-2] * 0.98)
+        closes          = df["close"]
+        current_price   = float(closes.iloc[-1])
+        rsi             = calculate_rsi(closes, period=RSI_PERIOD)
+        lod_180         = float(df["low"].tail(LOD_DAYS).min())
+        distance        = (current_price - lod_180) / lod_180 if lod_180 > 0 else 1.0
+        high_60d        = float(df["close"].tail(60).max())
+        crash_60d       = (high_60d - current_price) / high_60d if high_60d > 0 else 0.0
+        last_3_lows     = df["low"].tail(3).values
+        is_stabilizing  = bool(last_3_lows[-1] >= last_3_lows[-2] * 0.98)
         nearest_support = float(df["low"].tail(14).min())
         return {
             "rsi":             rsi,
@@ -160,20 +158,17 @@ class MarketScanner:
         if volume_usd < MIN_DAILY_VOLUME_USD:
             return False, f"حجم منخفض ${volume_usd:,.0f}"
 
-        rsi          = ind["rsi"]
-        crash_60d    = ind["crash_60d"]
-        distance     = ind["distance"]
-        stabilizing  = ind["is_stabilizing"]
+        rsi         = ind["rsi"]
+        crash_60d   = ind["crash_60d"]
+        distance    = ind["distance"]
+        stabilizing = ind["is_stabilizing"]
 
-        # استراتيجية A: انهيار حديث + تماسك
         if crash_60d >= 0.40 and rsi < 45 and stabilizing:
             return True, f"🅰️ انهيار حديث {crash_60d:.0%} + تماسك"
 
-        # استراتيجية B: قريبة من القاع التاريخي
         if distance <= MAX_DISTANCE_FROM_LOD and rsi < RSI_OVERSOLD_THRESHOLD:
             return True, f"🅱️ قاع تاريخي RSI={rsi:.1f}"
 
-        # استراتيجية C: انهيار ضخم جداً
         if crash_60d >= 0.60 and rsi < 35:
             return True, f"🅲 انهيار ضخم {crash_60d:.0%} RSI={rsi:.1f}"
 
@@ -212,9 +207,9 @@ class MarketScanner:
                 logger.info(f"[GitHub] {symbol}: مشروع غير نشط ❌")
                 continue
 
-            if "🅰️" in signal: stats["strategy_a"] += 1
+            if "🅰️" in signal:   stats["strategy_a"] += 1
             elif "🅱️" in signal: stats["strategy_b"] += 1
-            elif "🅲" in signal: stats["strategy_c"] += 1
+            elif "🅲" in signal:  stats["strategy_c"] += 1
 
             opp = TradeOpportunity(
                 symbol            = symbol,
