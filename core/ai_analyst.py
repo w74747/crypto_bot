@@ -177,7 +177,7 @@ def ask_deepseek(system: str, user_msg: str) -> str:
         return "مفتاح DeepSeek غير موجود"
     try:
         r = requests.post(
-            "https://api.deepseek.com/v1/chat/completions",
+            "https://api.groq.com/openai/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
                 "Content-Type":  "application/json",
