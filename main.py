@@ -1,6 +1,6 @@
 """
-main.py — مع فلتر الإرسال الحازم
-لا ترسل إشارة إلا إذا وافق Claude + خبير المخاطر
+main.py — بدون Claude أو Grok
+فلتر صارم: الفني + المخاطر موافقان
 """
 
 import asyncio
@@ -21,15 +21,17 @@ async def scanner_loop(notifier: TelegramNotifier):
 
     await notifier.send_plain_message(
         f"🤖 البوت يعمل | فحص كل {SCAN_INTERVAL_MINUTES} دقيقة\n"
-        f"🔒 فلتر صارم: لا إشارة بدون موافقة Claude + خبير المخاطر\n"
-        f"📊 DeepSeek → Groq → Together (تلقائي)"
+        f"🔒 فلتر صارم: لا إشارة بدون موافقة الفني + المخاطر\n"
+        f"📊 Groq → Together → DeepSeek (تلقائي)\n"
+        f"📡 Reddit RSS مجاني"
     )
 
     while True:
-        start_time = datetime.now()
-        logger.info(f"🔄 دورة: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        sent_count    = 0
+        start_time     = datetime.now()
+        sent_count     = 0
         filtered_count = 0
+
+        logger.info(f"🔄 دورة: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         try:
             for batch_opps, batch_num, total_batches in scanner.scan_market_batched():
@@ -37,23 +39,21 @@ async def scanner_loop(notifier: TelegramNotifier):
                 for opp in batch_opps:
                     try:
                         if AUTO_DEBATE:
-                            # نقاش الخبراء
                             from core.ai_analyst import run_expert_debate
                             debate = await asyncio.get_event_loop().run_in_executor(
                                 None, run_expert_debate, opp
                             )
                             rec = debate["recommendation"]
 
-                            # ── الفلتر الحاسم ──
+                            # الفلتر الحاسم
                             if not rec.get("send_signal", False):
                                 filtered_count += 1
                                 logger.info(
-                                    f"[Filter] {opp.symbol} مُرفَّح — "
+                                    f"[Filter] {opp.symbol} مُرشَّح — "
                                     f"{rec['label']} | {rec['votes']}"
                                 )
-                                continue  # لا ترسل هذه الإشارة
+                                continue
 
-                            # موافقة أساسية → أرسل
                             msg_id = await notifier.send_opportunity_with_debate_result(
                                 opp, debate
                             )
@@ -62,7 +62,7 @@ async def scanner_loop(notifier: TelegramNotifier):
 
                         register_opportunity(opp, msg_id)
                         sent_count += 1
-                        await asyncio.sleep(4)  # تجنب Flood Control
+                        await asyncio.sleep(4)
 
                     except Exception as e:
                         logger.error(f"[Send] خطأ {opp.symbol}: {e}")
@@ -80,6 +80,8 @@ async def scanner_loop(notifier: TelegramNotifier):
             f"✅ الدورة اكتملت خلال {elapsed} دقيقة | "
             f"أُرسلت: {sent_count} | مُرشَّحة: {filtered_count}"
         )
+
+        logger.info(f"⏳ الانتظار {SCAN_INTERVAL_MINUTES} دقيقة...")
         await asyncio.sleep(interval_seconds)
 
 
