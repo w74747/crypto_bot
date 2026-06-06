@@ -1,9 +1,9 @@
 """
 core/ai_analyst.py
 ==================
-نظام نقاش الخبراء — بدون Claude أو Grok
-Groq + Together + DeepSeek + Reddit RSS
-تكلفة شبه صفر مع جودة عالية
+نظام نقاش الخبراء — مع نظام تصويت منظم
+كل نموذج يُلزَم بإخراج [VOTE: YES] أو [VOTE: NO] فقط
+يمنع الخلط بين "موافق على رأي الخبير" و "موافق على الصفقة"
 """
 
 import os
@@ -12,46 +12,50 @@ import requests
 from utils.logger import logger
 from core.scanner import TradeOpportunity
 
-# ==========================================
-# مفاتيح API
-# ==========================================
 GROQ_API_KEY     = os.getenv("GROQ_API_KEY", "")
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
-# النماذج
 GROQ_MODEL     = os.getenv("GROQ_MODEL",     "llama-3.3-70b-versatile")
 TOGETHER_MODEL = os.getenv("TOGETHER_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
-MAX_TOKENS = 280
+MAX_TOKENS = 320
 
 # ==========================================
-# System Prompts — بعقلية مستثمر حقيقي
+# VOTE TAG — قاعدة لا استثناء فيها
 # ==========================================
-TECHNICAL_SYS = """أنت محلل تقني متخصص في العملات الرقمية مع 10 سنوات خبرة.
-أنت تحلل هذه الفرصة لاتخاذ قرار استثمار حقيقي.
-قواعد إلزامية:
-- اكتب بالعربية فقط بدون أي رموز Markdown
-- لا تتجاوز 60 كلمة
-- كن حازماً — لا "ربما" أو "قد يكون"
-- ركّز على: RSI، الأهداف الديناميكية، وقف الخسارة، R/R
-- آخر سطر حتماً: موافق أو رافض"""
+VOTE_INSTRUCTION = """
+قاعدة إلزامية لا يمكن تجاهلها:
+في آخر سطر من ردك، اكتب أحد هذين الخيارين فقط بالضبط، لا شيء آخر:
+[VOTE: YES]
+[VOTE: NO]
 
-RISK_SYS = """أنت مدير مخاطر في صندوق استثمار متخصص في العملات الرقمية.
-مهمتك: حماية رأس المال أولاً ثم تعظيم العائد.
-قواعد إلزامية:
-- اكتب بالعربية فقط بدون أي رموز Markdown
-- لا تتجاوز 60 كلمة
-- قيّم: السيولة، وقف الخسارة، نسبة R/R، السيناريو الأسوأ
-- آخر سطر حتماً: موافق أو رافض"""
+[VOTE: YES] = أنت توصي بدخول هذه الصفقة بأموال حقيقية
+[VOTE: NO]  = أنت لا توصي بدخول هذه الصفقة
 
-MARKET_SYS = """أنت محلل أسواق متخصص في العملات الرقمية يراقب السوق الكلي.
-قواعد إلزامية:
-- اكتب بالعربية فقط بدون أي رموز Markdown
-- لا تتجاوز 60 كلمة
-- قيّم: اتجاه السوق الكلي، قوة العملة مقارنة بـ BTC، مزاج المتداولين
-- آخر سطر حتماً: موافق أو رافض"""
+تحذير: لا تكتب "موافق" أو "رافض" أو أي كلمة أخرى — فقط [VOTE: YES] أو [VOTE: NO]
+"""
+
+# ==========================================
+# System Prompts
+# ==========================================
+TECHNICAL_SYS = f"""أنت محلل تقني متخصص في العملات الرقمية مع 10 سنوات خبرة.
+تحلل هذه الفرصة لاتخاذ قرار استثمار حقيقي بأموال حقيقية.
+ركّز على: RSI، مستويات الدعم والمقاومة، الأهداف الديناميكية، نسبة R/R.
+اكتب بالعربية فقط. لا تستخدم أي رموز Markdown. لا تتجاوز 70 كلمة في تحليلك.
+{VOTE_INSTRUCTION}"""
+
+RISK_SYS = f"""أنت مدير مخاطر في صندوق استثمار متخصص في العملات الرقمية.
+مهمتك الأولى: حماية رأس المال. مهمتك الثانية: تعظيم العائد.
+قيّم: السيولة، حجم التداول، وقف الخسارة، السيناريو الأسوأ، ونسبة R/R.
+اكتب بالعربية فقط. لا تستخدم أي رموز Markdown. لا تتجاوز 70 كلمة في تحليلك.
+{VOTE_INSTRUCTION}"""
+
+MARKET_SYS = f"""أنت محلل أسواق متخصص في العملات الرقمية يراقب السوق الكلي.
+قيّم: اتجاه السوق العام، قوة العملة، مزاج المتداولين، والسياق الكلي.
+اكتب بالعربية فقط. لا تستخدم أي رموز Markdown. لا تتجاوز 70 كلمة في تحليلك.
+{VOTE_INSTRUCTION}"""
 
 
 # ==========================================
@@ -68,6 +72,8 @@ def _clean(text: str) -> str:
 
 def _trim(text: str, n: int = 80) -> str:
     text = _clean(text.strip())
+    # أزل الـ VOTE tag من النص المختصر
+    text = re.sub(r'\[VOTE:\s*(YES|NO)\]', '', text).strip()
     if len(text) <= n:
         return text
     cut = text[:n]
@@ -76,6 +82,68 @@ def _trim(text: str, n: int = 80) -> str:
         if pos > n * 0.6:
             return cut[:pos+1]
     return cut + "..."
+
+
+# ==========================================
+# استخراج التصويت — STRUCTURED ONLY
+# ==========================================
+def extract_vote(text: str) -> str:
+    """
+    يستخرج التصويت من الـ structured tag فقط
+    [VOTE: YES] → approve
+    [VOTE: NO]  → reject
+    إذا لم يجد tag → يحلل النص بحذر شديد كـ fallback
+    """
+    if not text:
+        return "reject"  # بدون رد → رفض آمن
+
+    # البحث عن الـ structured tag
+    match = re.search(r'\[VOTE:\s*(YES|NO)\]', text, re.IGNORECASE)
+    if match:
+        vote = match.group(1).upper()
+        result = "approve" if vote == "YES" else "reject"
+        logger.debug(f"[Vote] Tag وُجد: [VOTE: {vote}] → {result}")
+        return result
+
+    # Fallback: النموذج لم يلتزم بالـ tag
+    # نستخدم تحليلاً محافظاً — الشك يُحسب رفضاً
+    logger.warning(f"[Vote] لم يُعثر على [VOTE] tag — تحليل محافظ: {text[:60]}")
+
+    text_lower = text.lower()
+
+    # كلمات رفض صريحة وواضحة السياق
+    hard_reject = [
+        "لا أنصح بالدخول", "لا توصية بالدخول",
+        "تجنب هذه الصفقة", "لا تدخل",
+        "خطر عالٍ جداً", "مخاطرة عالية جداً",
+        "i do not recommend", "do not enter",
+    ]
+    for phrase in hard_reject:
+        if phrase in text_lower:
+            logger.debug(f"[Vote Fallback] رفض صريح: '{phrase}'")
+            return "reject"
+
+    # كلمات موافقة صريحة وواضحة السياق
+    hard_approve = [
+        "أنصح بالدخول", "توصية بالدخول",
+        "فرصة ممتازة للدخول", "يستحق الدخول",
+        "i recommend entering", "good entry opportunity",
+    ]
+    for phrase in hard_approve:
+        if phrase in text_lower:
+            logger.debug(f"[Vote Fallback] موافقة صريحة: '{phrase}'")
+            return "approve"
+
+    # إذا لم يجد شيئاً واضحاً → رفض آمن
+    logger.debug(f"[Vote Fallback] غير محدد → رفض آمن")
+    return "reject"
+
+
+def extract_reddit_vote(text: str) -> str:
+    """Reddit لا يستخدم VOTE tag — يحلل المزاج المباشر"""
+    if "إيجابي" in text: return "approve"
+    if "سلبي"   in text: return "reject"
+    return "neutral"
 
 
 # ==========================================
@@ -99,13 +167,9 @@ def build_data(opp: TradeOpportunity) -> str:
 
 
 # ==========================================
-# Reddit RSS — مجاني كلياً
+# Reddit RSS
 # ==========================================
 def get_reddit_sentiment(coin_symbol: str) -> tuple[str, str]:
-    """
-    يجلب منشورات Reddit ويحلل المزاج
-    Returns: (النص الكامل, الموقف: approve/neutral/reject)
-    """
     coin = coin_symbol.replace("/USDT", "").lower()
     subreddits = ["CryptoCurrency", "CryptoMarkets", "altcoin"]
     posts_found = []
@@ -128,7 +192,6 @@ def get_reddit_sentiment(coin_symbol: str) -> tuple[str, str]:
                         "title":    title[:90],
                         "score":    p.get("score", 0),
                         "comments": p.get("num_comments", 0),
-                        "sub":      sub,
                     })
         except Exception:
             continue
@@ -136,43 +199,30 @@ def get_reddit_sentiment(coin_symbol: str) -> tuple[str, str]:
     if not posts_found:
         return f"لا توجد منشورات حديثة عن {coin_symbol} على Reddit.", "neutral"
 
-    positive_words = ["bull","moon","buy","pump","recovery","surge","bullish","gem","opportunity"]
-    negative_words = ["bear","dump","crash","down","rug","scam","falling","dead","bearish","warning"]
-
     pos = sum(1 for p in posts_found
-              for w in positive_words if w in p["title"].lower())
+              for w in ["bull","moon","buy","pump","recovery","bullish","gem"]
+              if w in p["title"].lower())
     neg = sum(1 for p in posts_found
-              for w in negative_words if w in p["title"].lower())
+              for w in ["bear","dump","crash","rug","scam","bearish","warning","dead"]
+              if w in p["title"].lower())
 
     if pos > neg:
-        sentiment = "إيجابي"
-        vote = "approve"
+        sentiment, vote = "إيجابي", "approve"
     elif neg > pos:
-        sentiment = "سلبي"
-        vote = "reject"
+        sentiment, vote = "سلبي", "reject"
     else:
-        sentiment = "محايد"
-        vote = "neutral"
+        sentiment, vote = "محايد", "neutral"
 
-    lines = [
-        f"r/{p['sub']}: {p['title']} (👍{p['score']} 💬{p['comments']})"
-        for p in posts_found[:3]
-    ]
-    text = f"مزاج Reddit: {sentiment}\n" + "\n".join(lines)
+    lines = [f"{p['title']} (👍{p['score']})" for p in posts_found[:2]]
+    text  = f"Reddit {sentiment}: " + " | ".join(lines)
     return text, vote
 
 
 # ==========================================
-# API Caller — صيغة OpenAI المشتركة
+# API Caller
 # ==========================================
-def _call_api(
-    api_key:  str,
-    base_url: str,
-    model:    str,
-    system:   str,
-    user_msg: str,
-    label:    str,
-) -> str:
+def _call_api(api_key: str, base_url: str, model: str,
+               system: str, user_msg: str, label: str) -> str:
     r = requests.post(
         f"{base_url}/chat/completions",
         headers={
@@ -191,110 +241,81 @@ def _call_api(
         timeout=30,
     )
     r.raise_for_status()
-    text = r.json()["choices"][0]["message"]["content"] or ""
-    return _clean(text)
+    return _clean(r.json()["choices"][0]["message"]["content"] or "")
 
 
 # ==========================================
-# الخبراء الثلاثة مع Fallback
+# الخبراء مع Fallback Chain
 # ==========================================
-def ask_technical_analyst(user_msg: str) -> tuple[str, str]:
+def _ask_with_fallback(
+    providers: list[tuple],
+    system:    str,
+    user_msg:  str,
+    role:      str,
+) -> tuple[str, str]:
     """
-    المحلل الفني — Groq أساسي، Together احتياطي، DeepSeek ثالث
+    يجرب المزودين بالترتيب ويُعيد (النص, اسم المزود)
+    يتحقق أن الرد يحتوي على [VOTE] tag
     """
-    providers = []
-    if GROQ_API_KEY:
-        providers.append(("Groq", GROQ_API_KEY,
-                          "https://api.groq.com/openai/v1", GROQ_MODEL))
-    if TOGETHER_API_KEY:
-        providers.append(("Together", TOGETHER_API_KEY,
-                          "https://api.together.xyz/v1", TOGETHER_MODEL))
-    if DEEPSEEK_API_KEY:
-        providers.append(("DeepSeek", DEEPSEEK_API_KEY,
-                          "https://api.deepseek.com/v1", DEEPSEEK_MODEL))
-
     for label, key, url, model in providers:
+        if not key:
+            continue
         try:
-            text = _call_api(key, url, model, TECHNICAL_SYS, user_msg, label)
-            logger.info(f"[Technical] {label} ✅")
-            return text, label
+            text = _call_api(key, url, model, system, user_msg, label)
+
+            # تحقق من وجود الـ VOTE tag
+            if re.search(r'\[VOTE:\s*(YES|NO)\]', text, re.IGNORECASE):
+                logger.info(f"[{role}] {label} ✅ (tag موجود)")
+                return text, label
+
+            # إذا لم يكن الـ tag موجوداً، أعد المحاولة مع تأكيد
+            logger.warning(f"[{role}] {label}: لا يوجد VOTE tag — إعادة المحاولة...")
+            retry_msg = user_msg + "\n\nتذكير: يجب أن ينتهي ردك بـ [VOTE: YES] أو [VOTE: NO]"
+            text2 = _call_api(key, url, model, system, retry_msg, label)
+            logger.info(f"[{role}] {label} ✅ (retry)")
+            return text2, label
+
         except Exception as e:
-            logger.warning(f"[Technical] {label} فشل: {str(e)[:50]}")
+            logger.warning(f"[{role}] {label} فشل: {str(e)[:60]}")
 
-    return "لا يوجد محلل فني متاح. رافض", "—"
-
-
-def ask_risk_expert(user_msg: str) -> tuple[str, str]:
-    """
-    خبير المخاطر — Together أساسي، DeepSeek احتياطي، Groq ثالث
-    """
-    providers = []
-    if TOGETHER_API_KEY:
-        providers.append(("Together", TOGETHER_API_KEY,
-                          "https://api.together.xyz/v1", TOGETHER_MODEL))
-    if DEEPSEEK_API_KEY:
-        providers.append(("DeepSeek", DEEPSEEK_API_KEY,
-                          "https://api.deepseek.com/v1", DEEPSEEK_MODEL))
-    if GROQ_API_KEY:
-        providers.append(("Groq", GROQ_API_KEY,
-                          "https://api.groq.com/openai/v1", GROQ_MODEL))
-
-    for label, key, url, model in providers:
-        try:
-            text = _call_api(key, url, model, RISK_SYS, user_msg, label)
-            logger.info(f"[Risk] {label} ✅")
-            return text, label
-        except Exception as e:
-            logger.warning(f"[Risk] {label} فشل: {str(e)[:50]}")
-
-    return "لا يوجد خبير مخاطر متاح. رافض", "—"
+    return f"لا يوجد مزود متاح. [VOTE: NO]", "—"
 
 
-def ask_market_analyst(user_msg: str) -> tuple[str, str]:
-    """
-    محلل السوق الكلي — DeepSeek أساسي، Groq احتياطي، Together ثالث
-    """
-    providers = []
-    if DEEPSEEK_API_KEY:
-        providers.append(("DeepSeek", DEEPSEEK_API_KEY,
-                          "https://api.deepseek.com/v1", DEEPSEEK_MODEL))
-    if GROQ_API_KEY:
-        providers.append(("Groq", GROQ_API_KEY,
-                          "https://api.groq.com/openai/v1", GROQ_MODEL))
-    if TOGETHER_API_KEY:
-        providers.append(("Together", TOGETHER_API_KEY,
-                          "https://api.together.xyz/v1", TOGETHER_MODEL))
+def ask_technical(user_msg: str) -> tuple[str, str]:
+    return _ask_with_fallback(
+        providers=[
+            ("Groq",     GROQ_API_KEY,     "https://api.groq.com/openai/v1",  GROQ_MODEL),
+            ("Together", TOGETHER_API_KEY, "https://api.together.xyz/v1",     TOGETHER_MODEL),
+            ("DeepSeek", DEEPSEEK_API_KEY, "https://api.deepseek.com/v1",     DEEPSEEK_MODEL),
+        ],
+        system   = TECHNICAL_SYS,
+        user_msg = user_msg,
+        role     = "Technical",
+    )
 
-    for label, key, url, model in providers:
-        try:
-            text = _call_api(key, url, model, MARKET_SYS, user_msg, label)
-            logger.info(f"[Market] {label} ✅")
-            return text, label
-        except Exception as e:
-            logger.warning(f"[Market] {label} فشل: {str(e)[:50]}")
+def ask_risk(user_msg: str) -> tuple[str, str]:
+    return _ask_with_fallback(
+        providers=[
+            ("Together", TOGETHER_API_KEY, "https://api.together.xyz/v1",     TOGETHER_MODEL),
+            ("DeepSeek", DEEPSEEK_API_KEY, "https://api.deepseek.com/v1",     DEEPSEEK_MODEL),
+            ("Groq",     GROQ_API_KEY,     "https://api.groq.com/openai/v1",  GROQ_MODEL),
+        ],
+        system   = RISK_SYS,
+        user_msg = user_msg,
+        role     = "Risk",
+    )
 
-    return "لا يوجد محلل سوق متاح. محايد", "—"
-
-
-# ==========================================
-# استخراج الموقف
-# ==========================================
-def extract_vote(text: str) -> str:
-    lines = [l.strip() for l in text.strip().split('\n') if l.strip()]
-    for line in reversed(lines[-3:]):
-        t = line.lower()
-        if any(w in t for w in ["موافق", "أوافق", "ادخل", "شراء"]):
-            return "approve"
-        if any(w in t for w in ["رافض", "أرفض", "تجنب", "لا تدخل"]):
-            return "reject"
-        if "محايد" in t:
-            return "neutral"
-    full = text.lower()
-    ap = sum(1 for w in ["موافق", "فرصة جيدة", "ادخل"] if w in full)
-    rj = sum(1 for w in ["رافض", "تجنب", "خطر", "لا أنصح"] if w in full)
-    if ap > rj: return "approve"
-    if rj > ap: return "reject"
-    return "neutral"
+def ask_market(user_msg: str) -> tuple[str, str]:
+    return _ask_with_fallback(
+        providers=[
+            ("DeepSeek", DEEPSEEK_API_KEY, "https://api.deepseek.com/v1",     DEEPSEEK_MODEL),
+            ("Groq",     GROQ_API_KEY,     "https://api.groq.com/openai/v1",  GROQ_MODEL),
+            ("Together", TOGETHER_API_KEY, "https://api.together.xyz/v1",     TOGETHER_MODEL),
+        ],
+        system   = MARKET_SYS,
+        user_msg = user_msg,
+        role     = "Market",
+    )
 
 
 # ==========================================
@@ -305,9 +326,7 @@ def run_expert_debate(opp: TradeOpportunity) -> dict:
     data = build_data(opp)
     log  = []
 
-    tech_model   = "—"
-    risk_model   = "—"
-    market_model = "—"
+    tech_model = risk_model = market_model = "—"
 
     def rec(round_num: int, speaker: str, text: str):
         vote = extract_vote(text)
@@ -317,146 +336,150 @@ def run_expert_debate(opp: TradeOpportunity) -> dict:
             "text":    text,
             "vote":    vote,
         })
-        logger.info(f"[Debate R{round_num}] {speaker} [{vote}]: {text[:55]}...")
+        # أظهر الـ VOTE tag في الـ log بوضوح
+        tag = re.search(r'\[VOTE:\s*(YES|NO)\]', text, re.IGNORECASE)
+        tag_str = f"[VOTE: {tag.group(1)}]" if tag else "[NO TAG]"
+        logger.info(
+            f"[Debate R{round_num}] {speaker} {tag_str} → {vote}: "
+            f"{_trim(text, 50)}"
+        )
 
     # Reddit
     reddit_text, reddit_vote = get_reddit_sentiment(coin)
     log.append({"round": 0, "speaker": "Reddit",
                 "text": reddit_text, "vote": reddit_vote})
-    logger.info(f"[Debate R0] Reddit [{reddit_vote}]: {reddit_text[:55]}...")
 
-    # ── جولة 1: تحليل مستقل ──
+    # ── جولة 1 ──
     logger.info(f"[Debate] جولة 1 — {opp.symbol}")
 
-    t1_text, tech_model = ask_technical_analyst(
-        f"بيانات الصفقة الكاملة:\n{data}\n\n"
+    t1, tech_model = ask_technical(
+        f"بيانات الصفقة:\n{data}\n\n"
         f"حكمك الفني: هل المؤشرات تدعم الدخول؟\n"
         f"حلّل RSI والأهداف الديناميكية ووقف الخسارة.\n"
-        f"آخر سطر: موافق أو رافض"
+        f"اكتب تحليلك ثم في السطر الأخير: [VOTE: YES] أو [VOTE: NO]"
     )
-    rec(1, f"فني/{tech_model}", t1_text)
+    rec(1, f"فني/{tech_model}", t1)
 
-    r1_text, risk_model = ask_risk_expert(
+    r1, risk_model = ask_risk(
         f"بيانات الصفقة:\n{data}\n\n"
         f"قيّم المخاطر: هل R/R={opp.risk_reward_ratio} مقبول؟\n"
-        f"هل الحجم ${opp.volume_24h_usd/1e6:.1f}M كافٍ للخروج؟\n"
-        f"آخر سطر: موافق أو رافض"
+        f"هل الحجم ${opp.volume_24h_usd/1e6:.1f}M كافٍ للخروج الآمن؟\n"
+        f"اكتب تحليلك ثم في السطر الأخير: [VOTE: YES] أو [VOTE: NO]"
     )
-    rec(1, f"مخاطر/{risk_model}", r1_text)
+    rec(1, f"مخاطر/{risk_model}", r1)
 
-    m1_text, market_model = ask_market_analyst(
+    m1, market_model = ask_market(
         f"بيانات: {data}\n"
         f"Reddit: {_trim(reddit_text, 80)}\n\n"
         f"قيّم السياق الكلي للسوق لهذه العملة.\n"
-        f"آخر سطر: موافق أو رافض"
+        f"اكتب تحليلك ثم في السطر الأخير: [VOTE: YES] أو [VOTE: NO]"
     )
-    rec(1, f"سوق/{market_model}", m1_text)
+    rec(1, f"سوق/{market_model}", m1)
 
     # إنهاء مبكر إذا رفض الجميع
-    votes_r1 = [extract_vote(t1_text), extract_vote(r1_text), extract_vote(m1_text)]
-    if votes_r1.count("reject") >= 3:
-        logger.info(f"[Debate] إجماع رفض جولة 1 — إنهاء مبكر")
-        for sp, tx in [(f"فني/{tech_model}", t1_text),
-                       (f"مخاطر/{risk_model}", r1_text),
-                       (f"سوق/{market_model}", m1_text)]:
+    v_t1 = extract_vote(t1)
+    v_r1 = extract_vote(r1)
+    if v_t1 == "reject" and v_r1 == "reject":
+        logger.info(f"[Debate] الفني والمخاطر رفضا → إنهاء مبكر")
+        for sp, tx in [(f"فني/{tech_model}", t1),
+                       (f"مخاطر/{risk_model}", r1),
+                       (f"سوق/{market_model}", m1)]:
             rec(3, sp, tx)
         return _finalize(opp, log, reddit_text, tech_model, risk_model, market_model)
 
-    # ── جولة 2: تحدٍّ متقاطع ──
+    # ── جولة 2 ──
     logger.info(f"[Debate] جولة 2 — {opp.symbol}")
 
-    t2_text, _ = ask_technical_analyst(
+    t2, _ = ask_technical(
         f"بيانات: {data}\n\n"
-        f"خبير المخاطر قال: {_trim(r1_text)}\n"
-        f"محلل السوق قال: {_trim(m1_text)}\n\n"
-        f"هل تغيّر رأيك الفني؟ إذا بقيت موقفك أعطِ سبباً تقنياً محدداً.\n"
-        f"آخر سطر: موافق أو رافض"
+        f"خبير المخاطر قال: {_trim(r1)}\n"
+        f"محلل السوق قال: {_trim(m1)}\n\n"
+        f"هل تُعدّل رأيك الفني بعد سماعهما؟\n"
+        f"اكتب تحليلك ثم في السطر الأخير: [VOTE: YES] أو [VOTE: NO]"
     )
-    rec(2, f"فني/{tech_model}", t2_text)
+    rec(2, f"فني/{tech_model}", t2)
 
-    r2_text, _ = ask_risk_expert(
+    r2, _ = ask_risk(
         f"بيانات: {data}\n\n"
-        f"المحلل الفني قال: {_trim(t1_text)}\n"
-        f"محلل السوق قال: {_trim(m1_text)}\n\n"
-        f"بعد سماعهما، هل تعدّل تقييم المخاطر؟\n"
-        f"آخر سطر: موافق أو رافض"
+        f"المحلل الفني قال: {_trim(t1)}\n"
+        f"محلل السوق قال: {_trim(m1)}\n\n"
+        f"بعد سماع التحليل الفني، هل تُعدّل تقييم المخاطر؟\n"
+        f"اكتب تحليلك ثم في السطر الأخير: [VOTE: YES] أو [VOTE: NO]"
     )
-    rec(2, f"مخاطر/{risk_model}", r2_text)
+    rec(2, f"مخاطر/{risk_model}", r2)
 
-    m2_text, _ = ask_market_analyst(
-        f"بيانات: {data}\n\n"
-        f"الفني: {_trim(t1_text, 50)} | المخاطر: {_trim(r1_text, 50)}\n\n"
-        f"هل تحليلهما يغيّر نظرتك للسوق الكلي؟\n"
-        f"آخر سطر: موافق أو رافض"
+    m2, _ = ask_market(
+        f"بيانات: {data[:120]}\n\n"
+        f"الفني: {_trim(t1, 50)} | المخاطر: {_trim(r1, 50)}\n\n"
+        f"هل تُعدّل نظرتك للسوق الكلي؟\n"
+        f"اكتب تحليلك ثم في السطر الأخير: [VOTE: YES] أو [VOTE: NO]"
     )
-    rec(2, f"سوق/{market_model}", m2_text)
+    rec(2, f"سوق/{market_model}", m2)
 
     # ── جولة 3: الحكم النهائي ──
     logger.info(f"[Debate] جولة 3 — {opp.symbol}")
 
-    t3_text, _ = ask_technical_analyst(
+    t3, _ = ask_technical(
         f"بيانات: {data}\n\n"
         f"بعد النقاش الكامل:\n"
-        f"المخاطر: {_trim(r2_text)}\n"
-        f"السوق: {_trim(m2_text)}\n"
+        f"المخاطر: {_trim(r2)}\n"
+        f"السوق: {_trim(m2)}\n"
         f"Reddit: {_trim(reddit_text, 50)}\n\n"
-        f"قرارك النهائي القاطع — هل تدخل بأموالك؟\n"
-        f"سبب واحد فقط.\n"
-        f"آخر سطر: موافق أو رافض"
+        f"قرارك النهائي القاطع — هل تدخل هذه الصفقة بأموالك الحقيقية؟\n"
+        f"سبب واحد فقط، ثم في السطر الأخير: [VOTE: YES] أو [VOTE: NO]"
     )
-    rec(3, f"فني/{tech_model}", t3_text)
+    rec(3, f"فني/{tech_model}", t3)
 
-    r3_text, _ = ask_risk_expert(
-        f"حكم المحلل الفني: {_trim(t3_text)}\n"
+    r3, _ = ask_risk(
+        f"حكم المحلل الفني: {_trim(t3)}\n"
         f"بيانات: {data}\n\n"
-        f"قرارك النهائي كمدير مخاطر — هل تُجيز الصفقة؟\n"
-        f"آخر سطر: موافق أو رافض"
+        f"قرارك النهائي كمدير مخاطر — هل تُجيز هذه الصفقة؟\n"
+        f"في السطر الأخير: [VOTE: YES] أو [VOTE: NO]"
     )
-    rec(3, f"مخاطر/{risk_model}", r3_text)
+    rec(3, f"مخاطر/{risk_model}", r3)
 
-    m3_text, _ = ask_market_analyst(
-        f"الفني قرر: {_trim(t3_text, 50)}\n"
-        f"المخاطر قرر: {_trim(r3_text, 50)}\n\n"
+    m3, _ = ask_market(
+        f"الفني: {_trim(t3, 50)} | المخاطر: {_trim(r3, 50)}\n\n"
         f"تصويتك الأخير بناءً على السوق الكلي.\n"
-        f"آخر سطر: موافق أو رافض"
+        f"في السطر الأخير: [VOTE: YES] أو [VOTE: NO]"
     )
-    rec(3, f"سوق/{market_model}", m3_text)
+    rec(3, f"سوق/{market_model}", m3)
 
     return _finalize(opp, log, reddit_text, tech_model, risk_model, market_model)
 
 
 # ==========================================
-# بناء النتيجة
+# بناء النتيجة النهائية
 # ==========================================
 def _finalize(opp, log, reddit_text, tech_model, risk_model, market_model) -> dict:
     r3 = {e["speaker"]: e["vote"] for e in log if e["round"] == 3}
 
-    vote_tech   = r3.get(f"فني/{tech_model}",   "neutral")
-    vote_risk   = r3.get(f"مخاطر/{risk_model}", "neutral")
-    vote_market = r3.get(f"سوق/{market_model}", "neutral")
-    vote_reddit = next((e["vote"] for e in log if e["round"] == 0), "neutral")
+    v_tech   = r3.get(f"فني/{tech_model}",   "reject")
+    v_risk   = r3.get(f"مخاطر/{risk_model}", "reject")
+    v_market = r3.get(f"سوق/{market_model}", "neutral")
+    v_reddit = next((e["vote"] for e in log if e["round"] == 0), "neutral")
 
-    all_votes = [vote_tech, vote_risk, vote_market, vote_reddit]
-    ap = all_votes.count("approve")
-    rj = all_votes.count("reject")
+    all_v = [v_tech, v_risk, v_market, v_reddit]
+    ap = all_v.count("approve")
+    rj = all_v.count("reject")
 
-    # الشرط الأساسي: الفني + المخاطر موافقان
-    core_ok = (vote_tech == "approve" and vote_risk == "approve")
+    # الشرط الأساسي: الفني + المخاطر كلاهما [VOTE: YES]
+    core_ok = (v_tech == "approve" and v_risk == "approve")
 
-    if   core_ok and ap == 4: label, emoji, conf = "إجماع كامل — دخول قوي",     "🟢", "عالية جداً 🔥🔥🔥"
-    elif core_ok and ap == 3: label, emoji, conf = "أغلبية قوية موافقة",         "🟢", "عالية جداً 🔥🔥"
-    elif core_ok and ap == 2: label, emoji, conf = "موافقة أساسية — مقبول",     "🟢", "عالية 🔥"
-    elif rj >= 3:             label, emoji, conf = "رفض واسع — تجنب",           "🔴", "رفض مؤكد ❄️"
-    elif vote_tech == "reject" or vote_risk == "reject":
-                              label, emoji, conf = "رفض أساسي — لا تدخل",       "🔴", "منخفضة ❄️"
-    else:                     label, emoji, conf = "غير محسوم — انتظار إشارة", "🟡", "منخفضة 💧"
+    if   core_ok and ap == 4: label, emoji, conf = "إجماع كامل — دخول قوي",    "🟢", "عالية جداً 🔥🔥🔥"
+    elif core_ok and ap == 3: label, emoji, conf = "أغلبية قوية موافقة",        "🟢", "عالية جداً 🔥🔥"
+    elif core_ok and ap == 2: label, emoji, conf = "موافقة أساسية — مقبول",    "🟢", "عالية 🔥"
+    elif rj >= 3:             label, emoji, conf = "رفض واسع — تجنب",          "🔴", "رفض مؤكد ❄️"
+    elif not core_ok and rj >= 1:
+                              label, emoji, conf = "رفض أساسي — لا تدخل",      "🔴", "منخفضة ❄️"
+    else:                     label, emoji, conf = "غير محسوم — انتظار",       "🟡", "منخفضة 💧"
 
     def ve(v): return "✅" if v=="approve" else ("❌" if v=="reject" else "⚠️")
     votes_str = (
-        f"فني {ve(vote_tech)}  "
-        f"مخاطر {ve(vote_risk)}  "
-        f"سوق {ve(vote_market)}  "
-        f"Reddit {ve(vote_reddit)}"
+        f"فني {ve(v_tech)}  "
+        f"مخاطر {ve(v_risk)}  "
+        f"سوق {ve(v_market)}  "
+        f"Reddit {ve(v_reddit)}"
     )
 
     rec = {
@@ -467,7 +490,10 @@ def _finalize(opp, log, reddit_text, tech_model, risk_model, market_model) -> di
         "send_signal":  core_ok,
     }
 
-    logger.info(f"[Debate] ✅ {opp.symbol} | {label} | {votes_str}")
+    logger.info(
+        f"[Debate] ✅ {opp.symbol} | {label} | {votes_str} | "
+        f"core_ok={core_ok}"
+    )
 
     return {
         "symbol":         opp.symbol,
