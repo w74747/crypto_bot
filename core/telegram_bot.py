@@ -1,5 +1,5 @@
 """
-core/telegram_bot.py — رسالة موحدة منسقة
+core/telegram_bot.py — رسالة موحدة مع 4 خبراء
 """
 
 import asyncio
@@ -12,7 +12,7 @@ from core.executor import TradeExecutor
 from utils.logger import logger
 
 
-def _trim(text: str, n: int = 100) -> str:
+def _trim(text: str, n: int = 110) -> str:
     text = text.strip()
     if len(text) <= n:
         return text
@@ -25,7 +25,7 @@ def _trim(text: str, n: int = 100) -> str:
 
 
 # ==========================================
-# رسالة الفرصة وحدها
+# رسالة الفرصة
 # ==========================================
 def format_opportunity(opp: TradeOpportunity) -> str:
     vol_m  = opp.volume_24h_usd / 1_000_000
@@ -33,58 +33,60 @@ def format_opportunity(opp: TradeOpportunity) -> str:
     return (
         f"🎯 <b>فرصة تداول — {opp.symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-
         f"<b>التحليل الفني</b>\n"
         f"RSI: <code>{opp.rsi_daily:.1f}</code>  |  "
         f"انهيار: <code>{opp.crash_pct_60d:.0%}</code>  |  "
         f"حجم: <code>${vol_m:.1f}M</code>\n"
         f"إشارة: <code>{opp.signal_type}</code>\n\n"
-
         f"<b>الصفقة</b>\n"
         f"دخول:  <code>{opp.entry_price:.8g}</code>\n"
-        f"وقف:   <code>{opp.stop_loss:.8g}</code>  "
-        f"<i>(-{sl_pct:.1f}%)</i>\n\n"
-
+        f"وقف:   <code>{opp.stop_loss:.8g}</code>  <i>(-{sl_pct:.1f}%)</i>\n\n"
         f"<b>الأهداف</b>\n"
-        f"TP1 +30%:  <code>{opp.tp1:.8g}</code>  → 40% كمية\n"
-        f"TP2 +60%:  <code>{opp.tp2:.8g}</code>  → 35% كمية\n"
-        f"TP3 +100%: <code>{opp.tp3:.8g}</code>  → 25% كمية\n\n"
-
+        f"TP1 +30%:  <code>{opp.tp1:.8g}</code>  → 40%\n"
+        f"TP2 +60%:  <code>{opp.tp2:.8g}</code>  → 35%\n"
+        f"TP3 +100%: <code>{opp.tp3:.8g}</code>  → 25%\n\n"
         f"نسبة R/R: <code>1:{opp.risk_reward_ratio}</code>"
     )
 
 
 # ==========================================
-# رسالة موحدة: فرصة + نقاش
+# رسالة موحدة: فرصة + نقاش رباعي
 # ==========================================
 def format_with_debate(opp: TradeOpportunity, debate: dict) -> str:
     base = format_opportunity(opp)
     rec  = debate["recommendation"]
     log  = debate.get("debate_log", [])
 
-    # خلاصة الجولة الثالثة فقط (الحكم النهائي)
+    # خلاصة الجولة الثالثة
     finals = {e["speaker"]: e["text"] for e in log if e["round"] == 3}
-    c_sum  = _trim(finals.get("Claude", "—"), 100)
-    g_sum  = _trim(finals.get("Gemini", "—"), 100)
-    gk_sum = _trim(finals.get("Grok",   "—"), 100)
+    # Reddit من الجولة 0
+    reddit = next((e["text"] for e in log if e["round"] == 0), "—")
+
+    c_sum  = _trim(finals.get("Claude",   "—"))
+    d_sum  = _trim(finals.get("DeepSeek", "—"))
+    gk_sum = _trim(finals.get("Grok",     "—"))
+    r_sum  = _trim(reddit, 80)
 
     debate_section = (
         f"\n\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"🧠 <b>رأي الخبراء</b>\n\n"
+        f"🧠 <b>رأي لجنة الخبراء</b>\n\n"
 
-        f"<b>Claude</b> — المحلل الفني\n"
+        f"<b>🤖 Claude</b> — المحلل الفني\n"
         f"<i>{c_sum}</i>\n\n"
 
-        f"<b>Gemini</b> — خبير المخاطر\n"
-        f"<i>{g_sum}</i>\n\n"
+        f"<b>🔵 DeepSeek</b> — خبير المخاطر\n"
+        f"<i>{d_sum}</i>\n\n"
 
-        f"<b>Grok</b> — محلل X\n"
+        f"<b>𝕏 Grok</b> — محلل X\n"
         f"<i>{gk_sum}</i>\n\n"
 
+        f"<b>📊 Reddit</b> — مزاج المجتمع\n"
+        f"<i>{r_sum}</i>\n\n"
+
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>التصويت:</b>  {rec['votes']}\n"
-        f"<b>القرار:</b>   {rec['emoji']} {rec['label']}\n"
-        f"<b>الثقة:</b>    {rec['confidence']}"
+        f"<b>التصويت:</b>\n{rec['votes']}\n\n"
+        f"<b>القرار:</b>  {rec['emoji']} <b>{rec['label']}</b>\n"
+        f"<b>الثقة:</b>   {rec['confidence']}"
     )
 
     return base + debate_section
@@ -147,14 +149,14 @@ class TelegramNotifier:
         if result.get("success"):
             text = (
                 f"✅ <b>تم تنفيذ الصفقة</b>\n\n"
-                f"العملة:       <code>{symbol}</code>\n"
-                f"سعر الشراء:   <code>{result['filled_price']:.8g}</code>\n"
-                f"الكمية:       <code>{result['filled_qty']}</code>\n"
-                f"رأس المال:    <code>${TRADE_AMOUNT_USD}</code>\n\n"
+                f"العملة:     <code>{symbol}</code>\n"
+                f"سعر الشراء: <code>{result['filled_price']:.8g}</code>\n"
+                f"الكمية:     <code>{result['filled_qty']}</code>\n"
+                f"رأس المال:  <code>${TRADE_AMOUNT_USD}</code>\n\n"
                 f"<b>أوامر البيع النشطة</b>\n"
-                f"TP1: <code>{result.get('tp1',0):.8g}</code>\n"
-                f"TP2: <code>{result.get('tp2',0):.8g}</code>\n"
-                f"TP3: <code>{result.get('tp3',0):.8g}</code>\n"
+                f"TP1: <code>{result.get('tp1',0):.8g}</code>  → 40%\n"
+                f"TP2: <code>{result.get('tp2',0):.8g}</code>  → 35%\n"
+                f"TP3: <code>{result.get('tp3',0):.8g}</code>  → 25%\n"
                 f"SL:  <code>{result.get('sl',0):.8g}</code>\n\n"
                 f"🛡️ وقف الخسارة نشط"
             )
@@ -173,7 +175,7 @@ class TelegramNotifier:
 
 
 # ==========================================
-# معالج الأزرار
+# مخزن الفرص + معالج الأزرار
 # ==========================================
 _pending:  dict[str, TradeOpportunity] = {}
 _msg_ids:  dict[str, int]              = {}
