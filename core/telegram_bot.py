@@ -1,5 +1,7 @@
 """
-core/telegram_bot.py — بدون Claude أو Grok
+core/telegram_bot.py
+إضافة: زر إعادة المحاولة عند فشل التنفيذ
+الفرصة تبقى في الذاكرة حتى النجاح أو التجاهل اليدوي
 """
 
 import asyncio
@@ -61,9 +63,9 @@ def format_with_debate(opp: TradeOpportunity, debate: dict) -> str:
     finals = {e["speaker"]: e["text"] for e in log if e["round"] == 3}
     reddit = next((e["text"] for e in log if e["round"] == 0), "—")
 
-    t_sum = _trim(finals.get(f"فني/{tech_model}",   "—"))
-    r_sum = _trim(finals.get(f"مخاطر/{risk_model}", "—"))
-    m_sum = _trim(finals.get(f"سوق/{market_model}", "—"))
+    t_sum  = _trim(finals.get(f"فني/{tech_model}",   "—"))
+    r_sum  = _trim(finals.get(f"مخاطر/{risk_model}", "—"))
+    m_sum  = _trim(finals.get(f"سوق/{market_model}", "—"))
     rd_sum = _trim(reddit, 90)
 
     return (
@@ -76,7 +78,7 @@ def format_with_debate(opp: TradeOpportunity, debate: dict) -> str:
         f"<i>{r_sum}</i>\n\n"
         f"<b>🌐 محلل السوق</b> ({market_model})\n"
         f"<i>{m_sum}</i>\n\n"
-        f"<b>📊 Reddit</b> — مزاج المجتمع\n"
+        f"<b>📊 Reddit</b>\n"
         f"<i>{rd_sum}</i>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>التصويت:</b>\n{rec['votes']}\n\n"
@@ -90,6 +92,15 @@ def create_keyboard(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ موافقة وتنفيذ", callback_data=f"execute:{clean}"),
         InlineKeyboardButton("❌ تجاهل",         callback_data=f"ignore:{clean}"),
+    ]])
+
+
+def create_retry_keyboard(symbol: str) -> InlineKeyboardMarkup:
+    """أزرار إعادة المحاولة بعد الفشل"""
+    clean = symbol.replace("/", "_")
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 إعادة المحاولة", callback_data=f"execute:{clean}"),
+        InlineKeyboardButton("❌ تجاهل",          callback_data=f"ignore:{clean}"),
     ]])
 
 
@@ -122,9 +133,12 @@ class TelegramNotifier:
         logger.info(f"[Telegram] ✅ {opp.symbol} | ID: {sent.message_id}")
         return sent.message_id
 
-    async def send_execution_result(self, result: dict):
+    async def send_execution_result(
+        self, result: dict, opp: Optional[TradeOpportunity] = None
+    ):
         from config.settings import TRADE_AMOUNT_USD
         symbol = result.get("symbol", "؟")
+
         if result.get("success"):
             text = (
                 f"✅ <b>تم تنفيذ الصفقة</b>\n\n"
@@ -139,23 +153,43 @@ class TelegramNotifier:
                 f"SL:  <code>{result.get('sl',0):.8g}</code>\n\n"
                 f"🛡️ وقف الخسارة نشط"
             )
+            await self.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML"
+            )
         else:
+            error = result.get("error", "خطأ غير معروف")
             text = (
                 f"❌ <b>فشل التنفيذ</b>\n\n"
                 f"العملة: <code>{symbol}</code>\n"
-                f"السبب: {result.get('error', 'خطأ غير معروف')}"
+                f"السبب: {error}\n\n"
+                f"<b>تحقق من:</b>\n"
+                f"• رصيد USDT في <b>Spot Wallet</b> في MEXC\n"
+                f"• الرصيد يكفي ${TRADE_AMOUNT_USD}\n\n"
+                f"بعد التأكد اضغط 🔄 إعادة المحاولة"
             )
-        await self.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML"
-        )
+            # إذا الفرصة لا تزال موجودة — أضف زر إعادة المحاولة
+            if opp:
+                await self.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=create_retry_keyboard(symbol),
+                )
+            else:
+                await self.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML"
+                )
 
     async def send_plain_message(self, text: str):
         await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
 
+# ==========================================
+# مخزن الفرص
+# ==========================================
 _pending:  dict[str, TradeOpportunity] = {}
 _msg_ids:  dict[str, int]              = {}
-_executor = None
+_executor: Optional[TradeExecutor]     = None
 
 
 def register_opportunity(opp: TradeOpportunity, msg_id: int = 0):
@@ -164,6 +198,9 @@ def register_opportunity(opp: TradeOpportunity, msg_id: int = 0):
     _msg_ids[clean] = msg_id
 
 
+# ==========================================
+# معالج الأزرار
+# ==========================================
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _executor
     query          = update.callback_query
@@ -171,27 +208,48 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     opp = _pending.get(symbol)
 
+    # تجاهل
     if action == "ignore":
         await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(f"⏭️ تم تجاهل {symbol.replace('_','/')}")
+        await query.message.reply_text(
+            f"⏭️ تم تجاهل {symbol.replace('_','/')}"
+        )
         _pending.pop(symbol, None)
         return
 
+    # تنفيذ أو إعادة محاولة
     if action == "execute":
         if not opp:
-            await query.message.reply_text("⚠️ انتهت صلاحية التوصية")
+            await query.message.reply_text(
+                "⚠️ انتهت صلاحية التوصية — انتظر الدورة القادمة"
+            )
             return
+
+        # أزل الأزرار من الرسالة الأصلية
         await query.edit_message_reply_markup(reply_markup=None)
+
         from config.settings import TRADE_AMOUNT_USD
         await query.message.reply_text(
-            f"⏳ جاري تنفيذ صفقة {opp.symbol}\n💰 المبلغ: ${TRADE_AMOUNT_USD}"
+            f"⏳ جاري تنفيذ صفقة {opp.symbol}\n"
+            f"💰 المبلغ: ${TRADE_AMOUNT_USD}"
         )
+
         if _executor is None:
             _executor = TradeExecutor()
+
         result = _executor.execute_full_trade(opp)
         notifier = TelegramNotifier()
-        await notifier.send_execution_result(result)
-        _pending.pop(symbol, None)
+
+        if result.get("success"):
+            # نجاح — احذف الفرصة من الذاكرة
+            await notifier.send_execution_result(result, opp=None)
+            _pending.pop(symbol, None)
+        else:
+            # فشل — أبقِ الفرصة وأرسل زر إعادة المحاولة
+            await notifier.send_execution_result(result, opp=opp)
+            logger.warning(
+                f"[Execute] فشل {opp.symbol} — الفرصة محفوظة لإعادة المحاولة"
+            )
 
 
 def build_application() -> Application:
