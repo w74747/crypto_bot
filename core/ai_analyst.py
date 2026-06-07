@@ -1,3 +1,4 @@
+TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "")
 """
 core/ai_analyst.py
 ==================
