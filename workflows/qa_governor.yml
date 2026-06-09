@@ -1,0 +1,26 @@
+name: QA Governor - Zero Bug Policy
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-python: '3.10'
+        
+    - name: Install Testing Dependencies
+      run: |
+        pip install pytest
+        
+    - name: Run Quality Governor Audit
+      run: |
+        pytest tests/test_quality_governor.py -v
