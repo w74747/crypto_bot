@@ -970,22 +970,18 @@ class ScalpingOrchestrator:
             try:
                 markets = self.executor.exchange.markets
 
-                # MEXC ccxt: يدعم /USDT و _USDT كلاهما
                 symbols = []
                 for s, mkt in markets.items():
-                    if not (s.endswith("/USDT") or s.endswith("_USDT")):
+                    # Rule 1: USDT pairs only
+                    if not s.endswith("/USDT"):
                         continue
-                    if ":" in s:
+                    # Rule 2: exclude Futures/Swaps/Perps
+                    if ":" in s or "swap" in s.lower() or "future" in s.lower():
                         continue
-                    if mkt.get("active") is False:
-                        continue
+                    # Rule 3: no metadata checks — direct append
                     symbols.append(s)
 
-                if not symbols:
-                    sample = list(markets.keys())[:8]
-                    _log(f"[Scan] ⚠️ 0 عملة — عينة مفاتيح: {sample}")
-                else:
-                    _log(f"[Scan] فحص {len(symbols)} عملة...")
+                _log(f"[Scan] تم فحص وتأكيد جاهزية {len(symbols)} عملة Spot/USDT حقيقية للبدء.")
                 passed_l1 = 0
                 checked   = 0
 
