@@ -970,21 +970,22 @@ class ScalpingOrchestrator:
             try:
                 markets = self.executor.exchange.markets
 
-                # MEXC: الأسواق الـ Spot لا تحتوي على مفتاح "spot" دائماً
-                # نعتمد على /USDT فقط مع تجاهل الأسواق غير النشطة
+                # MEXC ccxt: يدعم /USDT و _USDT كلاهما
                 symbols = []
                 for s, mkt in markets.items():
-                    if not s.endswith("/USDT"):
+                    if not (s.endswith("/USDT") or s.endswith("_USDT")):
                         continue
-                    # تجاهل Futures وPerps
-                    if ":" in s or "swap" in s.lower() or "future" in s.lower():
+                    if ":" in s:
                         continue
-                    # تحقق من أن السوق نشط
                     if mkt.get("active") is False:
                         continue
                     symbols.append(s)
 
-                _log(f"[Scan] فحص {len(symbols)} عملة Spot/USDT...")
+                if not symbols:
+                    sample = list(markets.keys())[:8]
+                    _log(f"[Scan] ⚠️ 0 عملة — عينة مفاتيح: {sample}")
+                else:
+                    _log(f"[Scan] فحص {len(symbols)} عملة...")
                 passed_l1 = 0
                 checked   = 0
 
