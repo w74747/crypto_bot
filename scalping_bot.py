@@ -614,9 +614,9 @@ class HighSpeedExecutor:
 
         try:
             o = self.exchange.create_order(
-                symbol, "STOP_LOSS_LIMIT", "sell", filled_qty,
+                symbol, "limit", "sell", filled_qty,
                 stop_loss * 0.999,
-                {"stopPrice": stop_loss, "type": "spot"},
+                {"stopPrice": stop_loss},
             )
             ids["sl_order_id"] = o["id"]
             _log(f"✅ SL: {stop_loss:.8g} ID:{o['id']}")
@@ -630,9 +630,9 @@ class HighSpeedExecutor:
         try:
             qty = self._apply_step_size(symbol, remaining_qty)
             o   = self.exchange.create_order(
-                symbol, "STOP_LOSS_LIMIT", "sell", qty,
+                symbol, "limit", "sell", qty,
                 entry_price * 0.999,
-                {"stopPrice": entry_price, "type": "spot"},
+                {"stopPrice": entry_price},
             )
             _log(f"✅ Break-Even {symbol}: SL→{entry_price:.8g} ID:{o['id']}")
             return o["id"]
