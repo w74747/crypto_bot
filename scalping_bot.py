@@ -993,19 +993,27 @@ class ScalpingOrchestrator:
 
                 symbols = []
                 for s, mkt in markets.items():
+                    # --- Surgical Shariah & ETF Compliance Shield ---
+                    base_asset = s.split("/")[0].split("_")[0].strip().upper()
+
+                    # Shariah blacklist
+                    if base_asset in self.cfg.blacklisted_assets:
+                        continue
+
+                    # Leveraged tokens (3L/3S/5L/5S/DOWN/UP)
+                    if any(p in base_asset for p in ["3L","3S","5L","5S","DOWN","UP"]):
+                        if len(base_asset) > 4 and any(base_asset.endswith(x) for x in ["3L","3S","5L","5S"]):
+                            continue
+                    # ------------------------------------------------
+
                     # Rule 1: USDT pairs only
                     if not s.endswith("/USDT"):
                         continue
                     # Rule 2: exclude Futures/Swaps/Perps
                     if ":" in s or "swap" in s.lower() or "future" in s.lower():
                         continue
-                    # Rule 3: Shariah Compliance — exclude blacklisted assets
-                    base = s.replace("/USDT", "")
-                    if base in self.cfg.blacklisted_assets:
-                        continue
-                    # Rule 4: no metadata checks — direct append
+                    # Rule 3: direct append
                     symbols.append(s)
-
                 _log(f"[Scan] تم فحص وتأكيد جاهزية {len(symbols)} عملة Spot/USDT حقيقية للبدء.")
                 passed_l1 = 0
                 checked   = 0
