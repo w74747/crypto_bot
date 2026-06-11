@@ -572,7 +572,7 @@ class HighSpeedExecutor:
         except Exception as e:
             _log(f"[Executor] ERROR {symbol}: {e}"); return None
 
-    def place_bracket(
+    async def place_bracket(
         self,
         symbol:       str,
         filled_qty:   float,
@@ -581,20 +581,21 @@ class HighSpeedExecutor:
         stop_loss:    float,
     ) -> dict:
         """
-        MEXC Code 30005 Fix — Monolithic Architecture:
-        ───────────────────────────────────────────────
-        Problem: placing TP1+TP2+TP3 as 3 separate limit orders freezes the
-                 full qty after TP1, causing TP2/TP3/SL to fail with "Oversold".
+        MEXC V3 Sequential Exit Deployment — eliminates Code 30005 & 700004:
+        ─────────────────────────────────────────────────────────────────────
+        Step 1: Place TP1 limit sell (100% qty) — book settles
+        Step 2: asyncio.sleep(1.5) — let exchange register the open order
+        Step 3: Place SL as stop-limit (price + stopPrice + triggerType)
+                MEXC V3 rejects stop-market (700004 missing price),
+                so we send limit type with explicit trigger params.
 
-        Solution:
-          - ONE limit sell for 100% qty at TP1 (guaranteed fill, no freeze conflict)
-          - ONE stop-market trigger for SL using MEXC stopPrice param
-          - TP2/TP3 are stored in SlotState for manual or future ladder upgrade
+        TP2/TP3 stored as reference — not placed to avoid Oversold conflicts.
+        Each order wrapped independently — SL failure never aborts TP tracking.
         """
         ids: dict = {}
         full_qty  = self._apply_step_size(symbol, filled_qty)
 
-        # ── Single TP1 Limit Sell — 100% quantity ──
+        # ── Step 1: TP1 Limit Sell — 100% quantity ──
         try:
             o = self.exchange.create_limit_sell_order(symbol, full_qty, tp1)
             ids["tp1_order_id"] = o["id"]
@@ -602,35 +603,37 @@ class HighSpeedExecutor:
         except Exception as e:
             _log(f"❌ TP1 FAILED {symbol}: {e}")
 
-        # ── Stop-Market SL — trigger order, does NOT freeze balance ──
-        # MEXC accepts stopPrice in params for market sell trigger
+        # ── Step 2: Settle delay — prevents concurrent freeze conflict ──
+        await asyncio.sleep(1.5)
+
+        # ── Step 3: SL as Stop-Limit (MEXC V3 compliant) ──
+        # MEXC V3 requires: type=limit + price + stopPrice + triggerType
+        # price must be explicit — stop-market returns 700004 "price required"
         try:
             o = self.exchange.create_order(
-                symbol, "market", "sell", full_qty,
-                None,
+                symbol,
+                "limit",
+                "sell",
+                full_qty,
+                stop_loss * 0.99,     # limit execution price (1% below trigger)
                 {
                     "stopPrice":   stop_loss,
-                    "triggerPrice": stop_loss,
-                    "type":        "stop",
+                    "triggerType": "LAST_PRICE",
                 },
             )
             ids["sl_order_id"] = o["id"]
-            _log(f"✅ SL Trigger: {stop_loss:.8g} ID:{o['id']}")
-        except Exception as e1:
-            _log(f"[SL] stop-market failed ({str(e1)[:60]}), trying limit trigger...")
-            # Fallback: limit trigger with stopPrice
-            try:
-                o = self.exchange.create_order(
-                    symbol, "limit", "sell", full_qty,
-                    stop_loss * 0.998,
-                    {"stopPrice": stop_loss},
+            _log(f"✅ SL Stop-Limit: trigger={stop_loss:.8g} limit={stop_loss*0.99:.8g} ID:{o['id']}")
+        except Exception as e:
+            err = str(e)
+            if "30005" in err or "Oversold" in err or "oversold" in err:
+                _log(
+                    f"[MEXC Safe Guard] SL skipped — tokens still settling for {symbol}. "
+                    f"Position is live but unprotected. Review manually."
                 )
-                ids["sl_order_id"] = o["id"]
-                _log(f"✅ SL Limit Trigger: {stop_loss:.8g} ID:{o['id']}")
-            except Exception as e2:
-                _log(f"❌ SL FAILED {symbol}: {e2} — راجع يدوياً!")
+            else:
+                _log(f"❌ SL FAILED {symbol}: {err[:100]} — راجع يدوياً!")
 
-        # Store TP2/TP3 in ids for reference (not placed — avoids freeze)
+        # TP2/TP3 stored as reference only — placing them would re-freeze qty
         ids["tp2_ref"] = tp2
         ids["tp3_ref"] = tp3
         return ids
@@ -704,10 +707,27 @@ class HighSpeedExecutor:
         if not buy:
             return None
 
-        bracket = self.place_bracket(
-            symbol, buy["filled_qty"], buy["filled_price"],
-            tp1, tp2, tp3, stop_loss,
-        )
+        # place_bracket is async — must be called from async context
+        # execute_full_trade is called via run_in_executor, so we use a new event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = pool.submit(
+                        asyncio.run,
+                        self.place_bracket(symbol, buy["filled_qty"], buy["filled_price"],
+                                           tp1, tp2, tp3, stop_loss)
+                    )
+                    bracket = future.result(timeout=20)
+            else:
+                bracket = loop.run_until_complete(
+                    self.place_bracket(symbol, buy["filled_qty"], buy["filled_price"],
+                                       tp1, tp2, tp3, stop_loss)
+                )
+        except Exception as e:
+            _log(f"[Executor] place_bracket error {symbol}: {e}")
+            bracket = {}
 
         return SlotState(
             symbol       = symbol,
