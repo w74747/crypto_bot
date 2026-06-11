@@ -845,20 +845,22 @@ class TradeMonitor:
         if not states:
             return
 
-        _log(f"[Reconcile] 🔍 فحص {len(states)} صفقة مفتوحة...")
+        _log(f"[Reconcile] \U0001f50d فحص {len(states)} صفقة مفتوحة...")
 
-        try:
-            # جلب جميع الأوامر المفتوحة من المنصة دفعة واحدة
-            all_open_orders = await asyncio.get_running_loop().run_in_executor(
-                None, self.executor.exchange.fetch_open_orders
-            )
-            open_order_ids = {str(o["id"]) for o in all_open_orders}
-        except Exception as e:
-            _log(f"[Reconcile] ⚠️ فشل جلب الأوامر المفتوحة: {e}")
-            return
-
+        # MEXC Spot requires explicit symbol — fetch per-symbol, not globally
         for state in states:
-            symbol = state.symbol
+            symbol         = state.symbol
+            open_order_ids: set = set()
+            try:
+                symbol_orders = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    self.executor.exchange.fetch_open_orders,
+                    symbol,
+                )
+                open_order_ids = {str(o["id"]) for o in symbol_orders}
+            except Exception as e:
+                _log(f"[Reconcile] فشل جلب أوامر {symbol}: {e}")
+
             await self._audit_slot(state, open_order_ids)
 
     async def _audit_slot(self, state: SlotState, open_order_ids: set):
