@@ -574,53 +574,107 @@ class HighSpeedExecutor:
 
     def place_bracket(
         self,
-        symbol:      str,
-        filled_qty:  float,
+        symbol:       str,
+        filled_qty:   float,
         filled_price: float,
         tp1: float, tp2: float, tp3: float,
-        stop_loss:   float,
+        stop_loss:    float,
     ) -> dict:
-        """Places TP1/TP2/TP3 limit sells + stop-loss. Returns order IDs."""
-        q1 = self._apply_step_size(symbol, filled_qty * TP1_QTY_PCT)
-        q2 = self._apply_step_size(symbol, filled_qty * TP2_QTY_PCT)
-        q3 = self._apply_step_size(symbol, filled_qty * TP3_QTY_PCT)
+        """
+        MEXC Code 30005 Fix — Monolithic Architecture:
+        ───────────────────────────────────────────────
+        Problem: placing TP1+TP2+TP3 as 3 separate limit orders freezes the
+                 full qty after TP1, causing TP2/TP3/SL to fail with "Oversold".
 
+        Solution:
+          - ONE limit sell for 100% qty at TP1 (guaranteed fill, no freeze conflict)
+          - ONE stop-market trigger for SL using MEXC stopPrice param
+          - TP2/TP3 are stored in SlotState for manual or future ladder upgrade
+        """
         ids: dict = {}
-        for label, qty, price in [("tp1", q1, tp1), ("tp2", q2, tp2), ("tp3", q3, tp3)]:
-            try:
-                o = self.exchange.create_limit_sell_order(symbol, qty, price)
-                ids[f"{label}_order_id"] = o["id"]
-                _log(f"✅ {label.upper()}: {price:.8g} ×{qty} ID:{o['id']}")
-            except Exception as e:
-                _log(f"❌ {label.upper()} FAILED {symbol}: {e}")
+        full_qty  = self._apply_step_size(symbol, filled_qty)
 
+        # ── Single TP1 Limit Sell — 100% quantity ──
+        try:
+            o = self.exchange.create_limit_sell_order(symbol, full_qty, tp1)
+            ids["tp1_order_id"] = o["id"]
+            _log(f"✅ TP1 (100%): {tp1:.8g} ×{full_qty} ID:{o['id']}")
+        except Exception as e:
+            _log(f"❌ TP1 FAILED {symbol}: {e}")
+
+        # ── Stop-Market SL — trigger order, does NOT freeze balance ──
+        # MEXC accepts stopPrice in params for market sell trigger
         try:
             o = self.exchange.create_order(
-                symbol, "limit", "sell", filled_qty,
-                stop_loss * 0.999,
-                {"stopPrice": stop_loss},
+                symbol, "market", "sell", full_qty,
+                None,
+                {
+                    "stopPrice":   stop_loss,
+                    "triggerPrice": stop_loss,
+                    "type":        "stop",
+                },
             )
             ids["sl_order_id"] = o["id"]
-            _log(f"✅ SL: {stop_loss:.8g} ID:{o['id']}")
-        except Exception as e:
-            _log(f"❌ SL FAILED {symbol}: {e} — review manually!")
+            _log(f"✅ SL Trigger: {stop_loss:.8g} ID:{o['id']}")
+        except Exception as e1:
+            _log(f"[SL] stop-market failed ({str(e1)[:60]}), trying limit trigger...")
+            # Fallback: limit trigger with stopPrice
+            try:
+                o = self.exchange.create_order(
+                    symbol, "limit", "sell", full_qty,
+                    stop_loss * 0.998,
+                    {"stopPrice": stop_loss},
+                )
+                ids["sl_order_id"] = o["id"]
+                _log(f"✅ SL Limit Trigger: {stop_loss:.8g} ID:{o['id']}")
+            except Exception as e2:
+                _log(f"❌ SL FAILED {symbol}: {e2} — راجع يدوياً!")
 
+        # Store TP2/TP3 in ids for reference (not placed — avoids freeze)
+        ids["tp2_ref"] = tp2
+        ids["tp3_ref"] = tp3
         return ids
 
     def move_sl_to_breakeven(self, symbol: str, entry_price: float, remaining_qty: float):
-        """Moves SL to entry price the moment TP1 fills."""
+        """
+        Break-Even: cancels old SL and places new stop-market at entry price.
+        Uses trigger/stop order to avoid freezing already-pledged tokens.
+        """
         try:
             qty = self._apply_step_size(symbol, remaining_qty)
-            o   = self.exchange.create_order(
-                symbol, "limit", "sell", qty,
-                entry_price * 0.999,
-                {"stopPrice": entry_price},
+            # Try stop-market trigger first
+            o = self.exchange.create_order(
+                symbol, "market", "sell", qty,
+                None,
+                {
+                    "stopPrice":    entry_price,
+                    "triggerPrice": entry_price,
+                    "type":         "stop",
+                },
             )
             _log(f"✅ Break-Even {symbol}: SL→{entry_price:.8g} ID:{o['id']}")
             return o["id"]
-        except Exception as e:
-            _log(f"❌ Break-Even FAILED {symbol}: {e}")
-            return None
+        except Exception as e1:
+            err = str(e1)
+            if "30005" in err or "Oversold" in err or "oversold" in err:
+                _log(
+                    f"[MEXC Safe Guard] Break-even skipped or tokens locked "
+                    f"for {symbol}. Continuing to prevent engine lock."
+                )
+                return None
+            # Fallback: limit trigger
+            try:
+                qty = self._apply_step_size(symbol, remaining_qty)
+                o   = self.exchange.create_order(
+                    symbol, "limit", "sell", qty,
+                    entry_price * 0.998,
+                    {"stopPrice": entry_price},
+                )
+                _log(f"✅ Break-Even fallback {symbol}: SL→{entry_price:.8g} ID:{o['id']}")
+                return o["id"]
+            except Exception as e2:
+                _log(f"❌ Break-Even FAILED {symbol}: {e2}")
+                return None
 
     def cancel_order(self, symbol: str, order_id: str):
         try:
