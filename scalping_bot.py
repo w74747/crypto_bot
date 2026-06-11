@@ -47,6 +47,12 @@ class Config:
     groq_model:        str   = field(default_factory=lambda: os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"))
     together_model:    str   = field(default_factory=lambda: os.environ.get("TOGETHER_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo"))
     deepseek_model:    str   = field(default_factory=lambda: os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"))
+    blacklisted_assets: set  = field(default_factory=lambda: {
+        "AAVE", "COMP", "MKR", "CRV", "LDO", "UNI", "SUSHI", "BAL",
+        "CAKE", "YFI", "SNX", "DYDX", "ANC", "FUN", "WIN", "DICE",
+        "BET", "RLB", "POLS", "MANA", "SAND", "GALA", "AXS", "SLP",
+        "XMR", "DASH", "ZEC"
+    })
 
 
 # ─────────────────────────────────────────────
@@ -967,6 +973,21 @@ class ScalpingOrchestrator:
             start = datetime.now()
             _log(f"🔄 Scan cycle: {start.strftime('%Y-%m-%d %H:%M:%S')}")
 
+            # ── Real-Time USDT Balance Guard ──
+            try:
+                balance_data = self.executor.exchange.fetch_balance()
+                free_usdt    = float(balance_data.get("USDT", {}).get("free", 0))
+                _log(f"[Balance] Free USDT: ${free_usdt:.2f} | Capital: ${self.cfg.capital:.2f}")
+                if free_usdt < self.cfg.capital:
+                    _log(
+                        f"[Scan Skip] USDT غير كافٍ (${free_usdt:.2f} < ${self.cfg.capital:.2f})"
+                        f" — انتظار 60 ثانية..."
+                    )
+                    await asyncio.sleep(60)
+                    continue
+            except Exception as e:
+                _log(f"[Balance ⚠️] فشل جلب الرصيد: {e}")
+
             try:
                 markets = self.executor.exchange.markets
 
@@ -978,7 +999,11 @@ class ScalpingOrchestrator:
                     # Rule 2: exclude Futures/Swaps/Perps
                     if ":" in s or "swap" in s.lower() or "future" in s.lower():
                         continue
-                    # Rule 3: no metadata checks — direct append
+                    # Rule 3: Shariah Compliance — exclude blacklisted assets
+                    base = s.replace("/USDT", "")
+                    if base in self.cfg.blacklisted_assets:
+                        continue
+                    # Rule 4: no metadata checks — direct append
                     symbols.append(s)
 
                 _log(f"[Scan] تم فحص وتأكيد جاهزية {len(symbols)} عملة Spot/USDT حقيقية للبدء.")
