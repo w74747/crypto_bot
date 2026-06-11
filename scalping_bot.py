@@ -49,6 +49,8 @@ class Config:
         "BET", "RLB", "POLS", "MANA", "SAND", "GALA", "AXS", "SLP",
         "XMR", "DASH", "ZEC"
     })
+    max_trade_hours:    float = field(default_factory=lambda: float(os.environ.get("MAX_TRADE_DURATION_HOURS", "4")))
+    reconcile_interval: int   = field(default_factory=lambda: int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "180")))
 
 
 # ─────────────────────────────────────────────
@@ -572,7 +574,7 @@ class HighSpeedExecutor:
         except Exception as e:
             _log(f"[Executor] ERROR {symbol}: {e}"); return None
 
-    async def place_bracket(
+    def place_bracket(
         self,
         symbol:       str,
         filled_qty:   float,
@@ -581,19 +583,18 @@ class HighSpeedExecutor:
         stop_loss:    float,
     ) -> dict:
         """
-        MEXC V3 Sequential Exit Deployment — eliminates Code 30005 & 700004:
-        ─────────────────────────────────────────────────────────────────────
-        Step 1: Place TP1 limit sell (100% qty) — book settles
-        Step 2: asyncio.sleep(1.5) — let exchange register the open order
-        Step 3: Place SL as stop-limit (price + stopPrice + triggerType)
-                MEXC V3 rejects stop-market (700004 missing price),
-                so we send limit type with explicit trigger params.
+        MEXC V3 Sequential Exit — fully sync, safe inside run_in_executor threads.
+        ────────────────────────────────────────────────────────────────────────────
+        Step 1: TP1 limit sell (100% qty)
+        Step 2: time.sleep(1.5) — sync sleep, no asyncio loop dependency
+        Step 3: SL stop-limit with explicit price + stopPrice + triggerType
 
-        TP2/TP3 stored as reference — not placed to avoid Oversold conflicts.
-        Each order wrapped independently — SL failure never aborts TP tracking.
+        Using time.sleep instead of asyncio.sleep eliminates the
+        "There is no current event loop in thread" error when called
+        from run_in_executor worker threads.
         """
-        ids: dict = {}
-        full_qty  = self._apply_step_size(symbol, filled_qty)
+        ids: dict    = {}
+        full_qty     = self._apply_step_size(symbol, filled_qty)
 
         # ── Step 1: TP1 Limit Sell — 100% quantity ──
         try:
@@ -603,37 +604,37 @@ class HighSpeedExecutor:
         except Exception as e:
             _log(f"❌ TP1 FAILED {symbol}: {e}")
 
-        # ── Step 2: Settle delay — prevents concurrent freeze conflict ──
-        await asyncio.sleep(1.5)
+        # ── Step 2: Sync settle delay (thread-safe, no event loop needed) ──
+        time.sleep(1.5)
 
-        # ── Step 3: SL as Stop-Limit (MEXC V3 compliant) ──
-        # MEXC V3 requires: type=limit + price + stopPrice + triggerType
-        # price must be explicit — stop-market returns 700004 "price required"
+        # ── Step 3: SL Stop-Limit — MEXC V3 explicit trigger format ──
         try:
             o = self.exchange.create_order(
                 symbol,
                 "limit",
                 "sell",
                 full_qty,
-                stop_loss * 0.99,     # limit execution price (1% below trigger)
+                stop_loss * 0.99,
                 {
                     "stopPrice":   stop_loss,
                     "triggerType": "LAST_PRICE",
                 },
             )
             ids["sl_order_id"] = o["id"]
-            _log(f"✅ SL Stop-Limit: trigger={stop_loss:.8g} limit={stop_loss*0.99:.8g} ID:{o['id']}")
+            _log(
+                f"✅ SL Stop-Limit: trigger={stop_loss:.8g} "
+                f"limit={stop_loss*0.99:.8g} ID:{o['id']}"
+            )
         except Exception as e:
             err = str(e)
             if "30005" in err or "Oversold" in err or "oversold" in err:
                 _log(
-                    f"[MEXC Safe Guard] SL skipped — tokens still settling for {symbol}. "
-                    f"Position is live but unprotected. Review manually."
+                    f"[MEXC Safe Guard] SL skipped — tokens still settling "
+                    f"for {symbol}. Position live but unprotected. Review manually."
                 )
             else:
                 _log(f"❌ SL FAILED {symbol}: {err[:100]} — راجع يدوياً!")
 
-        # TP2/TP3 stored as reference only — placing them would re-freeze qty
         ids["tp2_ref"] = tp2
         ids["tp3_ref"] = tp3
         return ids
@@ -707,24 +708,12 @@ class HighSpeedExecutor:
         if not buy:
             return None
 
-        # place_bracket is async — must be called from async context
-        # execute_full_trade is called via run_in_executor, so we use a new event loop
+        # place_bracket is sync — safe to call directly from any thread
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(
-                        asyncio.run,
-                        self.place_bracket(symbol, buy["filled_qty"], buy["filled_price"],
-                                           tp1, tp2, tp3, stop_loss)
-                    )
-                    bracket = future.result(timeout=20)
-            else:
-                bracket = loop.run_until_complete(
-                    self.place_bracket(symbol, buy["filled_qty"], buy["filled_price"],
-                                       tp1, tp2, tp3, stop_loss)
-                )
+            bracket = self.place_bracket(
+                symbol, buy["filled_qty"], buy["filled_price"],
+                tp1, tp2, tp3, stop_loss,
+            )
         except Exception as e:
             _log(f"[Executor] place_bracket error {symbol}: {e}")
             bracket = {}
@@ -760,10 +749,15 @@ class TradeMonitor:
         self._running = False
 
     async def start(self):
-        self._running = True
-        _log("[TradeMonitor] ✅ started — polling every 30s (bot IDs only)")
+        self._running        = True
+        self._reconcile_tick = 0
+        _log("[TradeMonitor] ✅ started — polling every 30s + reconciliation every 180s")
         while self._running:
             await self._check_all_slots()
+            self._reconcile_tick += self.cfg.monitor_interval
+            if self._reconcile_tick >= self.cfg.reconcile_interval:
+                self._reconcile_tick = 0
+                await self._reconcile_portfolio()
             await asyncio.sleep(self.cfg.monitor_interval)
 
     def stop(self):
@@ -836,6 +830,124 @@ class TradeMonitor:
                     f"TP3: <code>{state.tp3:.8g}</code>"
                 )
                 return
+
+    async def _reconcile_portfolio(self):
+        """
+        Self-Healing Reconciliation Engine — runs every 3 minutes.
+        Detects orphaned/broken positions and force-liquidates them.
+
+        A position is ORPHANED if:
+          - Bot owns the asset (in SlotManager) but has no active TP or SL
+            on the exchange order book.
+          - OR the trade has been open longer than MAX_TRADE_DURATION_HOURS.
+        """
+        states = self.slots.get_all_states()
+        if not states:
+            return
+
+        _log(f"[Reconcile] 🔍 فحص {len(states)} صفقة مفتوحة...")
+
+        try:
+            # جلب جميع الأوامر المفتوحة من المنصة دفعة واحدة
+            all_open_orders = await asyncio.get_running_loop().run_in_executor(
+                None, self.executor.exchange.fetch_open_orders
+            )
+            open_order_ids = {str(o["id"]) for o in all_open_orders}
+        except Exception as e:
+            _log(f"[Reconcile] ⚠️ فشل جلب الأوامر المفتوحة: {e}")
+            return
+
+        for state in states:
+            symbol = state.symbol
+            await self._audit_slot(state, open_order_ids)
+
+    async def _audit_slot(self, state: SlotState, open_order_ids: set):
+        """Audits a single slot — flags and liquidates if orphaned."""
+        symbol   = state.symbol
+        now      = time.time()
+        age_hrs  = (now - state.opened_at) / 3600
+
+        # ── Check 1: No active TP or SL on exchange ──
+        tp_active = bool(state.tp1_order_id and state.tp1_order_id in open_order_ids)
+        sl_active = bool(state.sl_order_id  and state.sl_order_id  in open_order_ids)
+
+        orphaned_no_exits = not tp_active and not sl_active
+
+        # ── Check 2: Trade exceeded max duration ──
+        orphaned_timeout  = age_hrs >= self.cfg.max_trade_hours
+
+        if not orphaned_no_exits and not orphaned_timeout:
+            _log(
+                f"[Reconcile] ✅ {symbol}: "
+                f"TP={'✅' if tp_active else '❌'} "
+                f"SL={'✅' if sl_active else '❌'} "
+                f"age={age_hrs:.1f}h"
+            )
+            return
+
+        # ── ORPHAN DETECTED ──
+        reason = []
+        if orphaned_no_exits: reason.append("no active TP/SL on exchange")
+        if orphaned_timeout:  reason.append(f"exceeded {self.cfg.max_trade_hours}h timeout")
+
+        _log(
+            f"🚨 [Self-Healing Alert] Orphaned/Broken position detected for "
+            f"{symbol}! Reason: {', '.join(reason)}. "
+            f"Initiating emergency market liquidation to recover capital."
+        )
+
+        # ── Cancel any lingering orders ──
+        for oid in [state.tp1_order_id, state.sl_order_id]:
+            if oid and oid in open_order_ids:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, self.executor.cancel_order, symbol, oid
+                    )
+                except Exception as e:
+                    _log(f"[Reconcile] Cancel {oid} failed: {e}")
+
+        await asyncio.sleep(0.5)  # brief settle after cancellations
+
+        # ── Emergency Market Sell ──
+        liquidated = await asyncio.get_running_loop().run_in_executor(
+            None, self._emergency_market_sell, symbol, state.filled_qty
+        )
+
+        if liquidated:
+            self.slots.release(symbol)
+            msg = (
+                "\U0001f6a8 <b>Self-Healing: تصفية طارئة</b>\n\n"
+                f"العملة: <code>{symbol}</code>\n"
+                f"السبب: {', '.join(reason)}\n"
+                "تم بيع الكمية كاملاً لاسترداد رأس المال."
+            )
+            await self._notify(msg)
+        else:
+            _log(f"[Reconcile] ❌ Emergency sell FAILED for {symbol} — يتطلب تدخلاً يدوياً!")
+            fail_msg = (
+                "❌ <b>Self-Healing فشل</b>\n\n"
+                f"العملة: <code>{symbol}</code>\n"
+                "فشل البيع الطارئ — راجع يدوياً فوراً!"
+            )
+            await self._notify(fail_msg)
+
+    def _emergency_market_sell(self, symbol: str, qty: float) -> bool:
+        """Synchronous emergency market sell — safe inside run_in_executor."""
+        try:
+            sell_qty = self.executor._apply_step_size(symbol, qty)
+            if sell_qty <= 0:
+                _log(f"[Emergency] {symbol}: qty={sell_qty} غير صالح")
+                return False
+
+            o = self.executor.exchange.create_market_sell_order(symbol, sell_qty)
+            _log(
+                f"[Emergency] ✅ {symbol}: بيع طارئ {sell_qty} "
+                f"@ market | ID:{o['id']}"
+            )
+            return True
+        except Exception as e:
+            _log(f"[Emergency] ❌ {symbol}: {str(e)[:100]}")
+            return False
 
     async def _notify(self, text: str):
         if not self.cfg.telegram_token or not self.cfg.telegram_chat_id:
