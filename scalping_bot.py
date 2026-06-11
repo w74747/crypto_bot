@@ -2,7 +2,7 @@
 scalping_bot.py
 ===============
 Production-Grade Crypto Scalping Engine
-Classes: Config | SlotManager | DataPipeline | ParallelAICommittee
+Classes: Config | SlotManager | DataPipeline | DeepSeekAnalyst
          HighSpeedExecutor | TradeMonitor | ScalpingOrchestrator
 """
 
@@ -30,8 +30,6 @@ class Config:
     mexc_api_secret:   str   = field(default_factory=lambda: os.environ.get("MEXC_API_SECRET", ""))
     telegram_token:    str   = field(default_factory=lambda: os.environ.get("TELEGRAM_BOT_TOKEN", ""))
     telegram_chat_id:  str   = field(default_factory=lambda: os.environ.get("TELEGRAM_CHAT_ID", ""))
-    groq_api_key:      str   = field(default_factory=lambda: os.environ.get("GROQ_API_KEY", ""))
-    together_api_key:  str   = field(default_factory=lambda: os.environ.get("TOGETHER_API_KEY") or os.environ.get("TOGATHER_API_KEY", ""))
     deepseek_api_key:  str   = field(default_factory=lambda: os.environ.get("DEEPSEEK_API_KEY", ""))
     cmc_api_key:       str   = field(default_factory=lambda: os.environ.get("COINMARKETCAP_API_KEY", ""))
     lunar_api_key:     str   = field(default_factory=lambda: os.environ.get("LUNARCRUSH_API_KEY", ""))
@@ -42,10 +40,8 @@ class Config:
     scan_interval:     int   = field(default_factory=lambda: int(os.environ.get("SCAN_INTERVAL_MINUTES", "60")))
     rsi_threshold:     int   = field(default_factory=lambda: int(os.environ.get("RSI_OVERSOLD_THRESHOLD", "31")))
     min_volume_usd:    float = field(default_factory=lambda: float(os.environ.get("MIN_DAILY_VOLUME_USD", "1000000")))
-    monitor_interval:  int   = 30   # ثوانٍ بين كل فحص للأوامر
-    max_ai_tokens:     int   = 120
-    groq_model:        str   = field(default_factory=lambda: os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"))
-    together_model:    str   = field(default_factory=lambda: os.environ.get("TOGETHER_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo"))
+    monitor_interval:  int   = 30
+    max_ai_tokens:     int   = 150
     deepseek_model:    str   = field(default_factory=lambda: os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"))
     blacklisted_assets: set  = field(default_factory=lambda: {
         "AAVE", "COMP", "MKR", "CRV", "LDO", "UNI", "SUSHI", "BAL",
@@ -323,134 +319,99 @@ def calculate_cascading_targets(
 
 
 # ─────────────────────────────────────────────
-# 6. PARALLEL AI COMMITTEE
 # ─────────────────────────────────────────────
-class ParallelAICommittee:
+# 6. DEEPSEEK ANALYST — sole AI brain, no Groq/Together
+# ─────────────────────────────────────────────
+class DeepSeekAnalyst:
     """
-    3 specialists run concurrently via asyncio.gather.
-    SL is NOT asked from AI — calculated purely in code.
-    Fib targets are suggested by AI but overridden by cascading engine.
-    Target latency: < 3 seconds.
+    Single async request to DeepSeek — no voting loops, no committees.
+    Returns BUY (proceed) or SKIP (reject).
+    SL is never touched by AI — pure code calculation.
+    Fib targets: AI hint → always overridden by cascading engine.
     """
 
-    SAFETY_SYS = (
-        "Safety Guard. Is 24h spot volume > $1M and order book depth adequate? "
-        "One sentence only, then on the last line: [SAFETY_VOTE: YES] or [SAFETY_VOTE: NO]"
-    )
-    FIB_SYS = (
-        "Fib Planner. Compute Fibonacci Internal Retracement targets for this 15m scalp. "
-        "One sentence, then:\n[TP1_PRICE: X.XXXX]\n[TP2_PRICE: X.XXXX]\n[TP3_PRICE: X.XXXX]"
+    SYSTEM_PROMPT = (
+        "You are a quantitative crypto scalping analyst. "
+        "Analyze the oversold asset data and decide instantly. "
+        "Output exactly one word on the last line: BUY or SKIP. "
+        "BUY = entry conditions are valid. SKIP = skip this asset."
     )
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
-    async def _call(
+    async def _call_deepseek(
         self,
         session:  aiohttp.ClientSession,
-        api_key:  str,
-        base_url: str,
-        model:    str,
-        system:   str,
         user_msg: str,
-        label:    str,
     ) -> str:
+        """Single async call to DeepSeek — timeout 8s."""
+        if not self.cfg.deepseek_api_key:
+            return ""
         try:
             async with session.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}",
-                         "Content-Type":  "application/json"},
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.cfg.deepseek_api_key}",
+                    "Content-Type":  "application/json",
+                },
                 json={
-                    "model":       model,
+                    "model":       self.cfg.deepseek_model,
                     "max_tokens":  self.cfg.max_ai_tokens,
                     "temperature": 0.1,
                     "messages": [
-                        {"role": "system", "content": system},
+                        {"role": "system", "content": self.SYSTEM_PROMPT},
                         {"role": "user",   "content": user_msg},
                     ],
                 },
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
                 if resp.status == 429:
-                    _log(f"[{label}] 429 Rate Limit")
+                    _log("[DeepSeek] 429 Rate Limit")
                     return ""
-                resp.raise_for_status()
+                if resp.status != 200:
+                    _log(f"[DeepSeek] HTTP {resp.status}")
+                    return ""
                 data = await resp.json()
                 return data["choices"][0]["message"]["content"] or ""
         except asyncio.TimeoutError:
-            _log(f"[{label}] Timeout")
+            _log("[DeepSeek] Timeout (8s)")
             return ""
         except Exception as e:
-            _log(f"[{label}] {str(e)[:60]}")
+            _log(f"[DeepSeek] {str(e)[:80]}")
             return ""
 
-    async def _call_fallback(
-        self,
-        session:   aiohttp.ClientSession,
-        providers: list[tuple],
-        system:    str,
-        user_msg:  str,
-        role:      str,
-    ) -> str:
-        for label, key, url, model in providers:
-            if not key:
-                continue
-            text = await self._call(session, key, url, model, system, user_msg, label)
-            if text:
-                _log(f"[{role}] {label} ✅")
-                return text
-        return ""
+    def _extract_verdict(self, text: str) -> str:
+        """Extracts BUY or SKIP from DeepSeek response."""
+        if not text:
+            return "SKIP"
+        # check last line first
+        last_line = text.strip().split("\n")[-1].strip().upper()
+        if last_line in ("BUY", "SKIP", "HOLD"):
+            return "BUY" if last_line == "BUY" else "SKIP"
+        # fallback: search anywhere
+        if "BUY" in text.upper():
+            return "BUY"
+        return "SKIP"
 
-    async def specialist_safety(
-        self, session: aiohttp.ClientSession, symbol: str,
-        rsi: float, vol_m: float
-    ) -> bool:
-        msg = (
-            f"Symbol: {symbol} | RSI: {rsi:.1f} | "
-            f"24h Volume: ${vol_m:.1f}M\n"
-            f"Is liquidity safe for a $30 scalp entry?"
-        )
-        text = await self._call_fallback(
-            session,
-            providers=[
-                ("Groq",     self.cfg.groq_api_key,     "https://api.groq.com/openai/v1", self.cfg.groq_model),
-                ("DeepSeek", self.cfg.deepseek_api_key, "https://api.deepseek.com/v1",    self.cfg.deepseek_model),
-            ],
-            system=self.SAFETY_SYS, user_msg=msg, role="Safety",
-        )
-        m = re.search(r'\[SAFETY_VOTE:\s*(YES|NO)\]', text, re.IGNORECASE)
-        voted = (m.group(1).upper() == "YES") if m else False
-        _log(f"[Safety] {symbol}: {'✅ YES' if voted else '❌ NO'}")
-        return voted
-
-    async def specialist_fib(
-        self, session: aiohttp.ClientSession,
-        symbol: str, entry: float, fib_high: float, fib_low: float, rsi: float
+    def _compute_fib_targets(
+        self, fib_high: float, fib_low: float,
+        entry: float, text: str
     ) -> dict:
-        msg = (
-            f"Symbol: {symbol} | Entry: {entry:.8g} | "
-            f"Local High: {fib_high:.8g} | Local Low: {fib_low:.8g} | RSI: {rsi:.1f}\n"
-            f"Compute 15m Fibonacci Internal Retracement targets."
-        )
-        text = await self._call_fallback(
-            session,
-            providers=[
-                ("DeepSeek", self.cfg.deepseek_api_key, "https://api.deepseek.com/v1",    self.cfg.deepseek_model),
-                ("Together", self.cfg.together_api_key, "https://api.together.xyz/v1",    self.cfg.together_model),
-            ],
-            system=self.FIB_SYS, user_msg=msg, role="Fib",
-        )
+        """
+        Extracts Fib targets from DeepSeek response if present,
+        then always runs through cascading engine for safety.
+        """
+        fib_range = fib_high - fib_low
 
         def extract(tag, default):
             m = re.search(rf'\[{tag}:\s*([\d.]+)\]', text)
             return float(m.group(1)) if m else default
 
-        fib_range = fib_high - fib_low
         ai_tp1 = extract("TP1_PRICE", fib_low + fib_range * 0.382)
         ai_tp2 = extract("TP2_PRICE", fib_low + fib_range * 0.500)
         ai_tp3 = extract("TP3_PRICE", fib_low + fib_range * 0.618)
 
-        # always run through cascading engine — AI output is a hint only
         return calculate_cascading_targets(
             fib_high=max(ai_tp3, fib_high),
             fib_low=min(ai_tp1, fib_low),
@@ -459,27 +420,42 @@ class ParallelAICommittee:
 
     async def run(
         self,
-        symbol:    str,
-        rsi:       float,
-        vol_m:     float,
-        entry:     float,
-        fib_high:  float,
-        fib_low:   float,
+        symbol:   str,
+        rsi:      float,
+        vol_m:    float,
+        entry:    float,
+        fib_high: float,
+        fib_low:  float,
     ) -> dict:
+        """
+        Single DeepSeek call combining safety check + Fib targets.
+        Returns: { safety_ok, targets, elapsed }
+        """
         start = time.time()
+
+        user_msg = (
+            f"Symbol: {symbol}\n"
+            f"RSI (Daily): {rsi:.1f} — oversold signal\n"
+            f"24h Spot Volume: ${vol_m:.1f}M\n"
+            f"Entry Price: {entry:.8g}\n"
+            f"Local High (60d): {fib_high:.8g}\n"
+            f"Local Low (60d): {fib_low:.8g}\n\n"
+            f"Evaluate this oversold scalp setup. "
+            f"If valid, also provide Fibonacci retracement targets:\n"
+            f"[TP1_PRICE: X.XXXX]\n[TP2_PRICE: X.XXXX]\n[TP3_PRICE: X.XXXX]\n\n"
+            f"Last line must be: BUY or SKIP"
+        )
+
         async with aiohttp.ClientSession() as session:
-            safety_coro = self.specialist_safety(session, symbol, rsi, vol_m)
-            fib_coro    = self.specialist_fib(session, symbol, entry, fib_high, fib_low, rsi)
-            safety_ok, targets = await asyncio.gather(safety_coro, fib_coro, return_exceptions=True)
+            text = await self._call_deepseek(session, user_msg)
 
-        if isinstance(safety_ok, Exception):
-            safety_ok = False
-        if isinstance(targets, Exception):
-            targets = calculate_cascading_targets(fib_high, fib_low, entry)
+        elapsed   = time.time() - start
+        verdict   = self._extract_verdict(text)
+        safety_ok = (verdict == "BUY")
+        targets   = self._compute_fib_targets(fib_high, fib_low, entry, text)
 
-        elapsed = time.time() - start
         _log(
-            f"[Committee] {symbol}: safety={'✅' if safety_ok else '❌'} "
+            f"[DeepSeek] {symbol}: {verdict} | "
             f"TP1={targets['tp1']:.6g} TP2={targets['tp2']:.6g} "
             f"TP3={targets['tp3']:.6g} | {elapsed:.1f}s"
         )
@@ -490,7 +466,6 @@ class ParallelAICommittee:
         }
 
 
-# ─────────────────────────────────────────────
 # 7. HIGH SPEED EXECUTOR
 # ─────────────────────────────────────────────
 TP1_QTY_PCT = 0.40
@@ -817,12 +792,15 @@ class ScalpingOrchestrator:
     """
 
     def __init__(self, cfg: Config):
-        self.cfg       = cfg
-        self.slots     = SlotManager(cfg)
-        self.pipeline  = DataPipeline(cfg)
-        self.committee = ParallelAICommittee(cfg)
-        self.executor  = HighSpeedExecutor(cfg)
-        self.monitor   = TradeMonitor(cfg, self.executor, self.slots)
+        self.cfg                = cfg
+        self.slots              = SlotManager(cfg)
+        self.pipeline           = DataPipeline(cfg)
+        self.committee          = DeepSeekAnalyst(cfg)
+        self.executor           = HighSpeedExecutor(cfg)
+        self.monitor            = TradeMonitor(cfg, self.executor, self.slots)
+        # Deduplication guard — prevents sub-second duplicate buys
+        self._processing_symbols: set[str] = set()
+        self._processing_lock               = threading.Lock()
 
     async def _send_telegram(self, text: str):
         if not self.cfg.telegram_token or not self.cfg.telegram_chat_id:
@@ -885,14 +863,31 @@ class ScalpingOrchestrator:
         session: aiohttp.ClientSession,
         symbol:  str,
     ):
-        if not self.slots.is_vacant(symbol):
-            return
+        # ── Deduplication Guard — blocks sub-second duplicate buys ──
+        with self._processing_lock:
+            if symbol in self._processing_symbols:
+                _log(f"[DeDup] {symbol}: already processing — skip")
+                return
+            if not self.slots.is_vacant(symbol):
+                return
+            self._processing_symbols.add(symbol)
 
+        try:
+            await self._process_candidate_inner(session, symbol)
+        finally:
+            with self._processing_lock:
+                self._processing_symbols.discard(symbol)
+
+    async def _process_candidate_inner(
+        self,
+        session: aiohttp.ClientSession,
+        symbol:  str,
+    ):
         ind = await asyncio.get_running_loop().run_in_executor(
             None, self._fetch_indicators, symbol
         )
         if not ind:
-            return  # خطأ مسجّل في _fetch_indicators
+            return
 
         _log(f"[Scan] {symbol}: RSI={ind['rsi']:.1f} Vol=${ind['vol_usd']/1e6:.1f}M")
 
@@ -905,7 +900,7 @@ class ScalpingOrchestrator:
             return
         _log(f"[L1 ✅] {symbol}: {reason}")
 
-        # ── Layer 2: AI Committee ──
+        # ── Layer 2: DeepSeek ──
         result = await self.committee.run(
             symbol   = symbol,
             rsi      = ind["rsi"],
@@ -916,12 +911,12 @@ class ScalpingOrchestrator:
         )
 
         if not result["safety_ok"]:
-            _log(f"[L2 ❌] {symbol}: Safety rejected ({result['elapsed']}s)")
+            _log(f"[L2 ❌] {symbol}: DeepSeek SKIP ({result['elapsed']}s)")
             return
 
         targets = result["targets"]
 
-        # ── SL: pure code calculation — AI never touches this ──
+        # ── SL: pure 15m swing low — AI never touches ──
         stop_loss = await asyncio.get_running_loop().run_in_executor(
             None, calculate_micro_swing_sl,
             self.executor.exchange, symbol, ind["current"]
@@ -933,16 +928,32 @@ class ScalpingOrchestrator:
             f"TP3={targets['tp3']:.6g} SL={stop_loss:.6g}"
         )
 
-        # ── Double-check slot still vacant (race condition guard) ──
+        # ── Final slot vacancy check before execution ──
         if not self.slots.is_vacant(symbol):
-            _log(f"[L3] {symbol}: slot taken by concurrent process — skip")
+            _log(f"[L3] {symbol}: slot taken — skip")
             return
 
-        # ── Layer 3: Execute ──
+        # ── Layer 3: Execute with live-price fallback ──
+        entry_price = ind["current"]
+
+        # Live price fallback — exchange sometimes returns 0 on fast markets
+        if not entry_price or entry_price == 0:
+            try:
+                ticker      = self.executor.exchange.fetch_ticker(symbol)
+                entry_price = float(ticker.get("last") or ticker.get("close") or 0)
+                _log(f"[L3] {symbol}: ⚠️ entry_price was 0 → live fallback: {entry_price:.8g}")
+            except Exception as e:
+                _log(f"[L3] {symbol}: live price fallback failed: {e}")
+                return
+
+        if entry_price <= 0:
+            _log(f"[L3] {symbol}: entry_price still 0 after fallback — abort")
+            return
+
         state = await asyncio.get_running_loop().run_in_executor(
             None,
             self.executor.execute_full_trade,
-            symbol, ind["current"],
+            symbol, entry_price,
             targets["tp1"], targets["tp2"], targets["tp3"], stop_loss,
         )
 
@@ -954,6 +965,10 @@ class ScalpingOrchestrator:
                 f"تحقق من رصيد USDT في Spot Wallet"
             )
             return
+
+        # Validate bracket was placed — warn if missing
+        if not state.tp1_order_id and not state.tp2_order_id and not state.tp3_order_id:
+            _log(f"[L3 ⚠️] {symbol}: تم الشراء لكن أوامر TP/SL لم تُوضع — راجع يدوياً!")
 
         self.slots.occupy(state)
 
@@ -970,7 +985,7 @@ class ScalpingOrchestrator:
             f"SL:  <code>{state.stop_loss:.8g}</code>  "
             f"(-{(1-state.stop_loss/state.entry_price)*100:.1f}%)\n\n"
             f"🛡️ SL ديناميكي (15m Swing Low)\n"
-            f"⏱️ AI Committee: {result['elapsed']}s"
+            f"⏱️ DeepSeek: {result['elapsed']}s"
         )
 
     async def scan_loop(self):
@@ -990,7 +1005,7 @@ class ScalpingOrchestrator:
 
             # ── Real-Time USDT Balance Guard ──
             try:
-                balance_data = self.executor.exchange.fetch_balance()
+                balance_data = self.executor.exchange.fetch_balance({"type": "spot"})
                 free_usdt    = float(balance_data.get("USDT", {}).get("free", 0))
                 _log(f"[Balance] Free USDT: ${free_usdt:.2f} | Capital: ${self.cfg.capital:.2f}")
                 if free_usdt < self.cfg.capital:
