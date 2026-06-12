@@ -604,8 +604,8 @@ class HighSpeedExecutor:
         except Exception as e:
             _log(f"❌ TP1 FAILED {symbol}: {e}")
 
-        # ── Step 2: Sync settle delay (thread-safe, no event loop needed) ──
-        time.sleep(1.5)
+        # ── Step 2: Sync settle delay — MEXC needs time to settle before sell orders ──
+        time.sleep(5)
 
         # ── Step 3: SL Stop-Limit — MEXC V3 explicit trigger format ──
         try:
@@ -934,21 +934,68 @@ class TradeMonitor:
             await self._notify(fail_msg)
 
     def _emergency_market_sell(self, symbol: str, qty: float) -> bool:
-        """Synchronous emergency market sell — safe inside run_in_executor."""
-        try:
-            sell_qty = self.executor._apply_step_size(symbol, qty)
-            if sell_qty <= 0:
-                _log(f"[Emergency] {symbol}: qty={sell_qty} غير صالح")
-                return False
+        """
+        Fee-Adjusted Emergency Market Sell.
+        ─────────────────────────────────────
+        Root cause of code 30005:
+          filled_qty stored in memory = gross purchase qty (e.g., 2914.885)
+          actual free wallet balance  = net after fees     (e.g., 2911.9)
+          → selling gross qty over-requests → Oversold error
 
-            o = self.executor.exchange.create_market_sell_order(symbol, sell_qty)
+        Fix: always fetch live FREE balance from MEXC before selling.
+             clip to actual free amount, apply precision, then sell.
+             On 30005 or zero free balance → release slot to stop infinite loop.
+        """
+        try:
+            # ── Step 1: Fetch live free balance (fee-adjusted real qty) ──
+            base_token = symbol.split("/")[0].split("_")[0]
+            balance    = self.executor.exchange.fetch_balance({"type": "spot"})
+            free_qty   = float(
+                balance.get(base_token, {}).get("free", 0) or
+                balance.get("free", {}).get(base_token, 0)
+            )
+
+            _log(f"[Emergency] {symbol}: cached={qty:.4f} free_wallet={free_qty:.4f}")
+
+            if free_qty <= 0:
+                _log(
+                    f"[Emergency] {symbol}: رصيد حر = 0 — "
+                    f"إما مُجمَّد بالكامل أو تم البيع مسبقاً. تحرير الـ slot."
+                )
+                return True  # release slot — stop infinite loop
+
+            # ── Step 2: Clip to free balance (never exceed what's available) ──
+            amount_to_sell = min(qty, free_qty)
+
+            # ── Step 3: Apply exchange precision using amount_to_precision ──
+            try:
+                precise_qty = float(
+                    self.executor.exchange.amount_to_precision(symbol, amount_to_sell)
+                )
+            except Exception:
+                precise_qty = self.executor._apply_step_size(symbol, amount_to_sell)
+
+            if precise_qty <= 0:
+                _log(f"[Emergency] {symbol}: qty={precise_qty} بعد precision — تحرير الـ slot.")
+                return True
+
+            # ── Step 4: Execute fee-adjusted market sell ──
+            o = self.executor.exchange.create_market_sell_order(symbol, precise_qty)
             _log(
-                f"[Emergency] ✅ {symbol}: بيع طارئ {sell_qty} "
-                f"@ market | ID:{o['id']}"
+                f"[Emergency] ✅ {symbol}: بيع طارئ {precise_qty} "
+                f"(من {free_qty:.4f} حر) @ market | ID:{o['id']}"
             )
             return True
+
         except Exception as e:
-            _log(f"[Emergency] ❌ {symbol}: {str(e)[:100]}")
+            err = str(e)
+            if "30005" in err or "Oversold" in err or "oversold" in err:
+                _log(
+                    f"[Emergency] {symbol}: code 30005 بعد تعديل الرسوم. "
+                    f"تحرير الـ slot لمنع التكرار اللانهائي."
+                )
+                return True  # release slot unconditionally on 30005
+            _log(f"[Emergency] ❌ {symbol}: {err[:120]}")
             return False
 
     async def _notify(self, text: str):
