@@ -583,55 +583,64 @@ class HighSpeedExecutor:
         stop_loss:    float,
     ) -> dict:
         """
-        MEXC V3 Sequential Exit — fully sync, safe inside run_in_executor threads.
-        ────────────────────────────────────────────────────────────────────────────
-        Step 1: TP1 limit sell (100% qty)
-        Step 2: time.sleep(1.5) — sync sleep, no asyncio loop dependency
-        Step 3: SL stop-limit with explicit price + stopPrice + triggerType
-
-        Using time.sleep instead of asyncio.sleep eliminates the
-        "There is no current event loop in thread" error when called
-        from run_in_executor worker threads.
+        MEXC V3 Sequential Exit — sync, thread-safe.
+        ─────────────────────────────────────────────
+        Step 1: Post-buy settle — time.sleep(2) lets MEXC clear tokens into wallet
+        Step 2: TP1 limit sell (100% qty) with price precision
+        Step 3: settle delay — time.sleep(5) before SL placement
+        Step 4: SL stop-limit with price_to_precision on both price fields
+                (prevents code 30087 "price exceeds allowed range")
         """
-        ids: dict    = {}
-        full_qty     = self._apply_step_size(symbol, filled_qty)
+        ids: dict = {}
+        full_qty  = self._apply_step_size(symbol, filled_qty)
 
-        # ── Step 1: TP1 Limit Sell — 100% quantity ──
+        # ── Step 1: Post-buy settling delay ──
+        # MEXC needs time to credit tokens to wallet before any sell order
+        time.sleep(2)
+
+        # ── Step 2: TP1 Limit Sell — price precision applied ──
         try:
-            o = self.exchange.create_limit_sell_order(symbol, full_qty, tp1)
+            tp1_price = float(self.exchange.price_to_precision(symbol, tp1))
+            o = self.exchange.create_limit_sell_order(symbol, full_qty, tp1_price)
             ids["tp1_order_id"] = o["id"]
-            _log(f"✅ TP1 (100%): {tp1:.8g} ×{full_qty} ID:{o['id']}")
+            _log(f"✅ TP1 (100%): {tp1_price:.8g} ×{full_qty} ID:{o['id']}")
         except Exception as e:
             _log(f"❌ TP1 FAILED {symbol}: {e}")
 
-        # ── Step 2: Sync settle delay — MEXC needs time to settle before sell orders ──
+        # ── Step 3: Settle delay before SL ──
         time.sleep(5)
 
-        # ── Step 3: SL Stop-Limit — MEXC V3 explicit trigger format ──
+        # ── Step 4: SL Stop-Limit — price_to_precision on both fields ──
+        # Prevents code 30087 "Price exceeds allowed range"
         try:
+            sl_trigger = float(self.exchange.price_to_precision(symbol, stop_loss))
+            sl_limit   = float(self.exchange.price_to_precision(symbol, stop_loss * 0.99))
+
             o = self.exchange.create_order(
                 symbol,
                 "limit",
                 "sell",
                 full_qty,
-                stop_loss * 0.99,
+                sl_limit,
                 {
-                    "stopPrice":   stop_loss,
+                    "stopPrice":   sl_trigger,
                     "triggerType": "LAST_PRICE",
                 },
             )
             ids["sl_order_id"] = o["id"]
             _log(
-                f"✅ SL Stop-Limit: trigger={stop_loss:.8g} "
-                f"limit={stop_loss*0.99:.8g} ID:{o['id']}"
+                f"✅ SL Stop-Limit: trigger={sl_trigger:.8g} "
+                f"limit={sl_limit:.8g} ID:{o['id']}"
             )
         except Exception as e:
             err = str(e)
             if "30005" in err or "Oversold" in err or "oversold" in err:
                 _log(
                     f"[MEXC Safe Guard] SL skipped — tokens still settling "
-                    f"for {symbol}. Position live but unprotected. Review manually."
+                    f"for {symbol}. Position live but unprotected."
                 )
+            elif "30087" in err:
+                _log(f"[MEXC 30087] SL price out of range {symbol}: {err[:80]}")
             else:
                 _log(f"❌ SL FAILED {symbol}: {err[:100]} — راجع يدوياً!")
 
@@ -698,17 +707,19 @@ class HighSpeedExecutor:
 
     def execute_full_trade(
         self,
-        symbol:    str,
+        symbol:      str,
         entry_price: float,
         tp1: float, tp2: float, tp3: float,
-        stop_loss: float,
+        stop_loss:   float,
     ) -> Optional[SlotState]:
-        """Executes buy + bracket. Returns SlotState or None on failure."""
+        """
+        Executes full trade: market buy → bracket (TP1 + SL).
+        place_bracket handles all delays internally.
+        """
         buy = self.market_buy(symbol, entry_price)
         if not buy:
             return None
 
-        # place_bracket is sync — safe to call directly from any thread
         try:
             bracket = self.place_bracket(
                 symbol, buy["filled_qty"], buy["filled_price"],
@@ -730,7 +741,6 @@ class HighSpeedExecutor:
             tp1=tp1, tp2=tp2, tp3=tp3,
             stop_loss=stop_loss,
         )
-
 
 # ─────────────────────────────────────────────
 # 8. TRADE MONITOR  — polls ONLY bot order IDs
