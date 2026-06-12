@@ -927,19 +927,57 @@ class TradeMonitor:
 
         if liquidated:
             self.slots.release(symbol)
+
+            # جلب سعر الخروج الفعلي لحساب PnL
+            exit_price = 0.0
+            try:
+                ticker     = self.executor.exchange.fetch_ticker(symbol)
+                exit_price = float(ticker.get("last") or ticker.get("close") or 0)
+            except Exception:
+                pass
+
+            entry   = state.entry_price
+            capital = entry * state.filled_qty
+
+            if exit_price > 0 and entry > 0:
+                pnl_usd = (exit_price - entry) * state.filled_qty
+                pnl_pct = ((exit_price - entry) / entry) * 100
+                if pnl_usd >= 0:
+                    pnl_line = f"✅ ربح: <b>+${pnl_usd:.3f} (+{pnl_pct:.2f}%)</b>"
+                else:
+                    pnl_line = f"🔴 خسارة: <b>${pnl_usd:.3f} ({pnl_pct:.2f}%)</b>"
+            else:
+                pnl_line = "⚠️ لم يتم احتساب PnL — سعر الخروج غير متاح"
+
+            reason_ar = []
+            for r in reason:
+                if "no active TP/SL" in r:
+                    reason_ar.append("لا توجد أوامر TP/SL نشطة على المنصة")
+                elif "timeout" in r:
+                    reason_ar.append(f"تجاوزت الحد الزمني ({self.cfg.max_trade_hours:.0f} ساعة)")
+                else:
+                    reason_ar.append(r)
+
             msg = (
-                "\U0001f6a8 <b>Self-Healing: تصفية طارئة</b>\n\n"
-                f"العملة: <code>{symbol}</code>\n"
-                f"السبب: {', '.join(reason)}\n"
-                "تم بيع الكمية كاملاً لاسترداد رأس المال."
+                "🟩 <b>المنصة: MEXC</b>\n"
+                "🚨 <b>Self-Healing: تصفية طارئة</b>\n\n"
+                f"• <b>العملة:</b> <code>{symbol}</code>\n"
+                f"• <b>السبب:</b> {' | '.join(reason_ar)}\n"
+                f"• <b>سعر الدخول:</b> <code>${entry:.8g}</code>"
+                f" | <b>سعر الخروج:</b> <code>${exit_price:.8g}</code>\n"
+                f"• <b>النتيجة:</b> {pnl_line}\n\n"
+                "<i>تم تسييل المراكز المتعثرة لفتح مقاعد صيد جديدة.</i>"
             )
             await self._notify(msg)
+
         else:
             _log(f"[Reconcile] ❌ Emergency sell FAILED for {symbol} — يتطلب تدخلاً يدوياً!")
             fail_msg = (
+                "🟩 <b>المنصة: MEXC</b>\n"
                 "❌ <b>Self-Healing فشل</b>\n\n"
-                f"العملة: <code>{symbol}</code>\n"
-                "فشل البيع الطارئ — راجع يدوياً فوراً!"
+                f"• <b>العملة:</b> <code>{symbol}</code>\n"
+                "• <b>السبب:</b> فشل البيع الطارئ — راجع يدوياً فوراً!\n\n"
+                "<i>يتطلب تدخلاً يدوياً عاجلاً.</i>"
             )
             await self._notify(fail_msg)
 
