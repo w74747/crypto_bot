@@ -959,7 +959,7 @@ class TradeMonitor:
                     reason_ar.append(r)
 
             msg = (
-                "🟩 <b>المنصة: MEXC</b>\n"
+                "🟦 <b>المنصة: MEXC</b>\n"
                 "🚨 <b>Self-Healing: تصفية طارئة</b>\n\n"
                 f"• <b>العملة:</b> <code>{symbol}</code>\n"
                 f"• <b>السبب:</b> {' | '.join(reason_ar)}\n"
@@ -973,7 +973,7 @@ class TradeMonitor:
         else:
             _log(f"[Reconcile] ❌ Emergency sell FAILED for {symbol} — يتطلب تدخلاً يدوياً!")
             fail_msg = (
-                "🟩 <b>المنصة: MEXC</b>\n"
+                "🟦 <b>المنصة: MEXC</b>\n"
                 "❌ <b>Self-Healing فشل</b>\n\n"
                 f"• <b>العملة:</b> <code>{symbol}</code>\n"
                 "• <b>السبب:</b> فشل البيع الطارئ — راجع يدوياً فوراً!\n\n"
@@ -1049,6 +1049,10 @@ class TradeMonitor:
     async def _notify(self, text: str):
         if not self.cfg.telegram_token or not self.cfg.telegram_chat_id:
             return
+        # Prepend MEXC header if not already present
+        header = "\U0001f7e6 <b>\u0627\u0644\u0645\u0646\u0635\u0629: MEXC</b>\n"
+        if "\u0627\u0644\u0645\u0646\u0635\u0629: MEXC" not in text:
+            text = header + text
         try:
             async with aiohttp.ClientSession() as session:
                 await session.post(
@@ -1088,6 +1092,10 @@ class ScalpingOrchestrator:
     async def _send_telegram(self, text: str):
         if not self.cfg.telegram_token or not self.cfg.telegram_chat_id:
             return
+        # Prepend MEXC header if not already present
+        header = "\U0001f7e6 <b>\u0627\u0644\u0645\u0646\u0635\u0629: MEXC</b>\n"
+        if "\u0627\u0644\u0645\u0646\u0635\u0629: MEXC" not in text:
+            text = header + text
         try:
             async with aiohttp.ClientSession() as session:
                 await session.post(
