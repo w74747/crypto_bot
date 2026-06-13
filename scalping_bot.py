@@ -546,19 +546,21 @@ class HighSpeedExecutor:
         stop_loss:    float,
     ) -> dict:
         """
-        Sequential TP + SL placement with settle delays.
-        Step 1: post-buy settle (2s)
-        Step 2: TP1 limit sell with price precision
-        Step 3: settle (5s)
-        Step 4: SL stop-limit with price precision (prevents 30087)
-        """
-        ids: dict    = {}
-        full_qty     = self._apply_step_size(symbol, filled_qty)
+        SHADOW SL ARCHITECTURE — eliminates double-booking (Insufficient Position):
+        ──────────────────────────────────────────────────────────────────────────
+        • TP1 Limit Sell → placed on exchange (locks full qty at target)
+        • SL → NOT sent to exchange — stored in slot.stop_loss (virtual/shadow)
+        • Monitor loop watches live price and triggers market sell if price ≤ SL
 
-        # ── Step 1: Post-buy settle ──
+        Benefit: no concurrent TP+SL double-booking → zero code 30005/30087
+        """
+        ids: dict = {}
+        full_qty  = self._apply_step_size(symbol, filled_qty)
+
+        # ── Post-buy settle: give MEXC time to credit tokens ──
         time.sleep(2)
 
-        # ── Step 2: TP1 Limit Sell ──
+        # ── TP1 Limit Sell — 100% qty ──
         try:
             tp1_price = float(self.exchange.price_to_precision(symbol, tp1))
             o = self.exchange.create_limit_sell_order(symbol, full_qty, tp1_price)
@@ -567,61 +569,28 @@ class HighSpeedExecutor:
         except Exception as e:
             _log(f"❌ TP1 FAILED {symbol}: {e}")
 
-        # ── Step 3: Settle before SL ──
-        time.sleep(5)
-
-        # ── Step 4: SL Stop-Limit ──
-        ids.update(self._place_sl_order(symbol, full_qty, stop_loss))
+        # SL is virtual — stored in slot, not sent to exchange
+        _log(
+            f"[Shadow SL] {symbol}: SL={stop_loss:.8g} (برمجائي صامت — "
+            f"المراقب سيُنفّذ market sell إذا وصل السعر)"
+        )
         return ids
 
-    def _place_sl_order(self, symbol: str, qty: float, stop_loss: float) -> dict:
-        """Places SL stop-limit — isolated for retry use."""
-        try:
-            sl_trigger = float(self.exchange.price_to_precision(symbol, stop_loss))
-            sl_limit   = float(self.exchange.price_to_precision(symbol, stop_loss * 0.99))
-            o = self.exchange.create_order(
-                symbol, "limit", "sell", qty, sl_limit,
-                {"stopPrice": sl_trigger, "triggerType": "LAST_PRICE"},
-            )
-            _log(f"✅ SL: trigger={sl_trigger:.8g} limit={sl_limit:.8g} ID:{o['id']}")
-            return {"sl_order_id": o["id"]}
-        except Exception as e:
-            err = str(e)
-            if "30005" in err or "Oversold" in err:
-                _log(f"[MEXC 30005] SL pending — tokens still settling for {symbol}")
-            elif "30087" in err:
-                _log(f"[MEXC 30087] SL price out of range {symbol}: {err[:80]}")
-            else:
-                _log(f"❌ SL FAILED {symbol}: {err[:100]}")
-            return {}
-
-    def re_place_tp_sl(
-        self,
-        symbol:    str,
-        state:     SlotState,
-    ) -> dict:
+    def re_place_tp(self, symbol: str, state: SlotState) -> dict:
         """
-        Retry placement of TP1 + SL for orphaned positions.
-        Called by Self-Healing before emergency liquidation.
+        Retry: re-place TP1 only if missing.
+        SL is virtual — no exchange order needed.
         """
-        full_qty = self._apply_step_size(symbol, state.filled_qty)
         ids: dict = {}
-
-        # TP1
         if not state.tp1_order_id:
             try:
+                full_qty  = self._apply_step_size(symbol, state.filled_qty)
                 tp1_price = float(self.exchange.price_to_precision(symbol, state.tp1))
                 o = self.exchange.create_limit_sell_order(symbol, full_qty, tp1_price)
                 ids["tp1_order_id"] = o["id"]
                 _log(f"[Retry] ✅ TP1 re-placed {symbol}: {tp1_price:.8g} ID:{o['id']}")
             except Exception as e:
                 _log(f"[Retry] TP1 failed {symbol}: {e}")
-
-        # SL
-        if not state.sl_order_id:
-            time.sleep(2)
-            ids.update(self._place_sl_order(symbol, full_qty, state.stop_loss))
-
         return ids
 
     def emergency_tp1_sell(self, symbol: str, qty: float, tp1: float) -> Optional[str]:
@@ -707,7 +676,7 @@ class HighSpeedExecutor:
             symbol       = symbol,
             buy_order_id = buy["order_id"],
             tp1_order_id = bracket.get("tp1_order_id", ""),
-            sl_order_id  = bracket.get("sl_order_id",  ""),
+            sl_order_id  = "",  # Shadow SL — not placed on exchange
             entry_price  = buy["filled_price"],
             filled_qty   = buy["filled_qty"],
             tp1=tp1, tp2=tp2, tp3=tp3,
@@ -748,26 +717,52 @@ class TradeMonitor:
     async def _check_slot(self, state: SlotState):
         symbol = state.symbol
 
-        # Check SL hit
-        if state.sl_order_id:
-            sl_status = await asyncio.get_running_loop().run_in_executor(
-                None, self.executor.fetch_order_status, symbol, state.sl_order_id
-            )
-            if sl_status == "closed":
-                _log(f"[Monitor] 🛑 SL HIT: {symbol}")
-                self.slots.release(symbol)
-                await self._notify_exit(state, "SL", state.stop_loss)
-                return
+        # ── Shadow SL Monitor — fetch live price and compare to virtual SL ──
+        if state.stop_loss > 0:
+            try:
+                ticker     = await asyncio.get_running_loop().run_in_executor(
+                    None, self.executor.exchange.fetch_ticker, symbol
+                )
+                curr_price = float(ticker.get("last") or ticker.get("close") or 0)
 
-        # Check TP1 hit → move SL to break-even
+                if curr_price > 0 and curr_price <= state.stop_loss:
+                    _log(
+                        f"[Shadow SL] 🛑 {symbol}: curr={curr_price:.8g} "
+                        f"≤ SL={state.stop_loss:.8g} — bypass trigger!"
+                    )
+                    # Cancel all TP orders to release locked qty
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(
+                            None,
+                            self.executor.exchange.cancel_all_orders,
+                            symbol,
+                        )
+                        _log(f"[Shadow SL] {symbol}: TP orders cancelled")
+                    except Exception as e:
+                        _log(f"[Shadow SL] cancel_all failed {symbol}: {e}")
+
+                    await asyncio.sleep(0.5)
+
+                    # Full market sell of free balance
+                    liquidated = await asyncio.get_running_loop().run_in_executor(
+                        None, self.executor.emergency_market_sell,
+                        symbol, state.filled_qty
+                    )
+                    self.slots.release(symbol)
+                    await self._notify_exit(state, "SL", curr_price)
+                    return
+
+            except Exception as e:
+                _log(f"[Shadow SL] price fetch failed {symbol}: {e}")
+
+        # ── TP1 fill check ──
         if state.tp1_order_id and not state.break_even_attempted:
             tp1_status = await asyncio.get_running_loop().run_in_executor(
                 None, self.executor.fetch_order_status, symbol, state.tp1_order_id
             )
             if tp1_status == "closed":
-                _log(f"[Monitor] 🎯 TP1 HIT: {symbol} → break-even")
+                _log(f"[Monitor] 🎯 TP1 HIT: {symbol}")
                 self.slots.update_state(symbol, break_even_attempted=True)
-                remaining = state.filled_qty * 0.0  # monolithic — all sold at TP1
                 self.slots.release(symbol)
                 await self._notify_exit(state, "TP1", state.tp1)
                 return
@@ -801,14 +796,15 @@ class TradeMonitor:
         now     = time.time()
         age_hrs = (now - state.opened_at) / 3600
 
+        # Shadow SL: SL is virtual — only check TP1 presence on exchange
         tp_active = bool(state.tp1_order_id and state.tp1_order_id in open_order_ids)
-        sl_active = bool(state.sl_order_id  and state.sl_order_id  in open_order_ids)
 
-        orphaned_no_exits = not tp_active and not sl_active
+        # Orphaned = no TP1 on exchange (SL absence is expected — it's virtual)
+        orphaned_no_exits = not tp_active
         orphaned_timeout  = age_hrs >= self.cfg.max_trade_hours and not state.extended
 
         if not orphaned_no_exits and not orphaned_timeout:
-            _log(f"[Reconcile] ✅ {symbol}: TP={'✅' if tp_active else '❌'} SL={'✅' if sl_active else '❌'} age={age_hrs:.1f}h")
+            _log(f"[Reconcile] ✅ {symbol}: TP={'✅' if tp_active else '❌'} SL=برمجائي age={age_hrs:.1f}h")
             return
 
         # ── Timeout: check if extension warranted ──
@@ -826,13 +822,13 @@ class TradeMonitor:
 
         _log(f"🚨 [Self-Healing] {symbol}: {reason_ar}")
 
-        # ── Retry sequence: re_place_tp_sl up to 3 times ──
+        # ── Retry sequence: re_place_tp up to 3 times ──
         recovered = False
         for attempt in range(1, self.cfg.sl_retry_attempts + 1):
             _log(f"[Self-Healing] {symbol}: محاولة إعادة وضع TP/SL ({attempt}/{self.cfg.sl_retry_attempts})")
             try:
                 new_ids = await asyncio.get_running_loop().run_in_executor(
-                    None, self.executor.re_place_tp_sl, symbol, state
+                    None, self.executor.re_place_tp, symbol, state
                 )
                 if new_ids.get("tp1_order_id") or new_ids.get("sl_order_id"):
                     if new_ids.get("tp1_order_id"):
