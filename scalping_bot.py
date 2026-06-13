@@ -1038,7 +1038,12 @@ class ScalpingOrchestrator:
             _log(f"[Scan] ❌ {symbol}: {type(e).__name__}: {str(e)[:80]}")
             return None
 
-    async def _process_candidate(self, session: aiohttp.ClientSession, symbol: str):
+    async def _process_candidate(
+        self,
+        session:         aiohttp.ClientSession,
+        symbol:          str,
+        initial_balance: float = 0.0,
+    ):
         with self._processing_lock:
             if symbol in self._processing_symbols:
                 return
@@ -1047,12 +1052,17 @@ class ScalpingOrchestrator:
             self._processing_symbols.add(symbol)
 
         try:
-            await self._process_inner(session, symbol)
+            await self._process_inner(session, symbol, initial_balance)
         finally:
             with self._processing_lock:
                 self._processing_symbols.discard(symbol)
 
-    async def _process_inner(self, session: aiohttp.ClientSession, symbol: str):
+    async def _process_inner(
+        self,
+        session:         aiohttp.ClientSession,
+        symbol:          str,
+        initial_balance: float = 0.0,
+    ):
         ind = await asyncio.get_running_loop().run_in_executor(
             None, self._fetch_indicators, symbol
         )
@@ -1130,18 +1140,25 @@ class ScalpingOrchestrator:
         )
 
         if not state:
-            _log(f"[L3 ❌] {symbol}: execution failed")
-            await self._send_telegram(
-                "⚠️ <b>فشل التنفيذ</b>\n\n"
-                f"• <b>العملة:</b> <code>{symbol}</code>\n"
-                "• تحقق من رصيد USDT في Spot Wallet"
-            )
+            # Silent failure — no Telegram spam, log only
+            _log(f"[L3 ❌] {symbol}: execution failed — silent cooldown")
             return
 
         if not state.tp1_order_id and not state.sl_order_id:
             _log(f"[L3 ⚠️] {symbol}: تم الشراء لكن TP/SL لم تُوضع")
 
         self.slots.occupy(state)
+
+        # جلب الرصيد الحالي بعد التنفيذ
+        current_balance = 0.0
+        try:
+            bal             = self.executor.exchange.fetch_balance({"type": "spot"})
+            current_balance = float(
+                bal.get("USDT", {}).get("free", 0) or
+                bal.get("free", {}).get("USDT", 0)
+            )
+        except Exception:
+            pass
 
         tp1_pct = (state.tp1 / state.entry_price - 1) * 100
         tp2_pct = (state.tp2 / state.entry_price - 1) * 100
@@ -1158,12 +1175,15 @@ class ScalpingOrchestrator:
             f"• TP1: <code>{state.tp1:.8g}</code>  (+{tp1_pct:.1f}%) — 100%\n"
             f"• TP2: <code>{state.tp2:.8g}</code>  (+{tp2_pct:.1f}%) — مرجعي\n"
             f"• TP3: <code>{state.tp3:.8g}</code>  (+{tp3_pct:.1f}%) — مرجعي\n"
-            f"• SL:  <code>{state.stop_loss:.8g}</code>  (-{sl_pct:.1f}%)\n\n"
+            f"• SL:  <code>{state.stop_loss:.8g}</code>  (-{sl_pct:.1f}%) (برمجائي صامت)\n\n"
+            f"• <b>الرصيد الافتتاحي:</b> <code>${initial_balance:.2f}</code>\n"
+            f"• <b>الرصيد الحالي:</b>    <code>${current_balance:.2f}</code>\n\n"
             f"• <b>Committee:</b> DeepSeek={result['ds_vote']} Llama={result['llama_vote']}\n"
             f"• <b>RSS Macro:</b> {rss_sentiment}\n"
             f"• <b>Galaxy Score:</b> {lunar_data.get('galaxy_score', 0):.0f}\n"
             f"⏱️ {result['elapsed']}s"
         )
+
 
     async def scan_loop(self):
         await self._send_telegram(
@@ -1179,14 +1199,18 @@ class ScalpingOrchestrator:
             start = datetime.now()
             _log(f"🔄 Scan: {start.strftime('%Y-%m-%d %H:%M:%S')}")
 
-            # ── Balance Guard ──
+            # ── Pre-Flight Balance Audit ──
+            initial_balance = 0.0
             try:
-                bal      = self.executor.exchange.fetch_balance({"type": "spot"})
-                free_usd = float(bal.get("USDT", {}).get("free", 0) or
-                                 bal.get("free", {}).get("USDT", 0))
-                _log(f"[Balance] Free USDT: ${free_usd:.2f} | Capital: ${self.cfg.capital:.2f}")
-                if free_usd < self.cfg.capital:
-                    _log(f"[Balance] غير كافٍ — انتظار 60s")
+                bal             = self.executor.exchange.fetch_balance({"type": "spot"})
+                initial_balance = float(
+                    bal.get("USDT", {}).get("free", 0) or
+                    bal.get("free", {}).get("USDT", 0)
+                )
+                _log(f"[Balance] الرصيد الافتتاحي: ${initial_balance:.2f} | مطلوب: ${self.cfg.capital:.2f}")
+
+                if initial_balance < self.cfg.capital:
+                    _log("[Balance Guard] Scanner halted. Insufficient funds.")
                     await asyncio.sleep(60)
                     continue
             except Exception as e:
@@ -1214,7 +1238,10 @@ class ScalpingOrchestrator:
                 async with aiohttp.ClientSession() as session:
                     for i in range(0, len(symbols), BATCH):
                         batch   = symbols[i:i+BATCH]
-                        tasks   = [self._process_candidate(session, sym) for sym in batch]
+                        tasks   = [
+                            self._process_candidate(session, sym, initial_balance)
+                            for sym in batch
+                        ]
                         await asyncio.gather(*tasks, return_exceptions=True)
                         checked = i + len(batch)
                         if checked % 50 == 0:
@@ -1223,7 +1250,6 @@ class ScalpingOrchestrator:
 
             except Exception as e:
                 _log(f"❌ Scan error: {e}")
-                await self._send_telegram(f"⚠️ Scan error: {str(e)[:100]}")
 
             elapsed = (datetime.now() - start).seconds // 60
             _log(f"✅ Cycle: {elapsed}m | slots={self.slots.used}/{self.cfg.max_slots}")
