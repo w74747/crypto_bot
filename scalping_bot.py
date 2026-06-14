@@ -1048,6 +1048,74 @@ class ScalpingOrchestrator:
         self._processing_symbols:   set[str] = set()
         self._processing_lock:      threading.Lock = threading.Lock()
 
+    def _restore_open_positions(self):
+        """
+        عند إعادة تشغيل البوت: يفحص MEXC ويسترد الصفقات المفتوحة
+        في الذاكرة حتى يعمل TradeMonitor على متابعتها.
+
+        يبحث عن أصول في الحساب تحتوي على Limit Sell orders مفتوحة
+        ويُعيد بناء SlotState بسيط لكل منها.
+        """
+        _log("[Restore] 🔄 فحص صفقات مفتوحة من إعادة التشغيل...")
+        try:
+            bal      = self.executor.exchange.fetch_balance({"type": "spot"})
+            balances = bal.get("total", {})
+
+            restored = 0
+            for asset, total_qty in balances.items():
+                if asset in ("USDT", "USDC") or float(total_qty or 0) <= 0:
+                    continue
+
+                symbol = f"{asset}/USDT"
+                if symbol not in self.executor.exchange.markets:
+                    continue
+
+                # جلب الأوامر المفتوحة لهذا الزوج
+                try:
+                    open_orders = self.executor.exchange.fetch_open_orders(symbol)
+                except Exception:
+                    continue
+
+                limit_sells = [o for o in open_orders if o.get("side") == "sell"]
+                if not limit_sells:
+                    continue
+
+                # حساب سعر الدخول التقريبي من أول Limit Sell
+                tp1_order  = limit_sells[0]
+                tp1_price  = float(tp1_order.get("price", 0))
+                filled_qty = float(total_qty)
+
+                # سعر الدخول التقريبي — أقل من TP1 بنسبة معقولة
+                approx_entry = tp1_price / 1.03 if tp1_price > 0 else 0
+                approx_sl    = approx_entry * 0.92 if approx_entry > 0 else 0
+
+                if approx_entry <= 0 or filled_qty <= 0:
+                    continue
+
+                state = SlotState(
+                    symbol       = symbol,
+                    buy_order_id = "restored",
+                    tp1_order_id = str(tp1_order.get("id", "")),
+                    entry_price  = approx_entry,
+                    filled_qty   = filled_qty,
+                    tp1          = tp1_price,
+                    tp2          = tp1_price * 1.03,
+                    tp3          = tp1_price * 1.06,
+                    stop_loss    = approx_sl,
+                )
+                self.slots.occupy(state)
+                restored += 1
+                _log(
+                    f"[Restore] ✅ {symbol}: "
+                    f"qty={filled_qty:.4f} TP1={tp1_price:.8g} "
+                    f"SL={approx_sl:.8g} (برمجائي)"
+                )
+
+            _log(f"[Restore] اكتمل — {restored} صفقة مُستردة")
+
+        except Exception as e:
+            _log(f"[Restore] ⚠️ خطأ: {e}")
+
     async def _send_telegram(self, text: str):
         if not self.cfg.telegram_token or not self.cfg.telegram_chat_id:
             return
@@ -1274,7 +1342,10 @@ class ScalpingOrchestrator:
             _log(f"🔄 Scan: {start.strftime('%Y-%m-%d %H:%M:%S')}")
 
             # ── Pre-Flight Balance Audit ──
+            # Balance Guard يوقف البحث عن فرص جديدة فقط
+            # لا يؤثر على TradeMonitor — المراقبة تعمل دائماً مستقلة
             initial_balance = 0.0
+            scanner_active  = True
             try:
                 bal             = self.executor.exchange.fetch_balance({"type": "spot"})
                 initial_balance = float(
@@ -1284,52 +1355,60 @@ class ScalpingOrchestrator:
                 _log(f"[Balance] الرصيد الافتتاحي: ${initial_balance:.2f} | مطلوب: ${self.cfg.capital:.2f}")
 
                 if initial_balance < self.cfg.capital:
-                    _log("[Balance Guard] Scanner halted. Insufficient funds.")
-                    await asyncio.sleep(60)
-                    continue
+                    _log(
+                        "[Balance Guard] Scanner halted. Insufficient funds. "
+                        "TradeMonitor continues independently."
+                    )
+                    scanner_active = False
             except Exception as e:
                 _log(f"[Balance ⚠️] {e}")
+                scanner_active = False
 
-            # ── Build symbol list ──
-            try:
-                markets = self.executor.exchange.markets
-                symbols = []
-                for s, mkt in markets.items():
-                    if not s.endswith("/USDT"):
-                        continue
-                    if ":" in s or "swap" in s.lower() or "future" in s.lower():
-                        continue
-                    base = s.split("/")[0].upper()
-                    if base in self.cfg.blacklisted_assets:
-                        continue
-                    if any(s.endswith(p) for p in ["3L/USDT","3S/USDT","5L/USDT","5S/USDT"]):
-                        continue
-                    symbols.append(s)
+            # ── Market Scanner — runs only when balance is sufficient ──
+            if scanner_active:
+                try:
+                    markets = self.executor.exchange.markets
+                    symbols = []
+                    for s, mkt in markets.items():
+                        if not s.endswith("/USDT"):
+                            continue
+                        if ":" in s or "swap" in s.lower() or "future" in s.lower():
+                            continue
+                        base = s.split("/")[0].upper()
+                        if base in self.cfg.blacklisted_assets:
+                            continue
+                        if any(s.endswith(p) for p in ["3L/USDT","3S/USDT","5L/USDT","5S/USDT"]):
+                            continue
+                        symbols.append(s)
 
-                _log(f"[Scan] {len(symbols)} عملة Spot/USDT جاهزة للفحص")
+                    _log(f"[Scan] {len(symbols)} عملة Spot/USDT جاهزة للفحص")
 
-                BATCH = 5
-                async with aiohttp.ClientSession() as session:
-                    for i in range(0, len(symbols), BATCH):
-                        batch   = symbols[i:i+BATCH]
-                        tasks   = [
-                            self._process_candidate(session, sym, initial_balance)
-                            for sym in batch
-                        ]
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                        checked = i + len(batch)
-                        if checked % 50 == 0:
-                            _log(f"[Scan] {checked}/{len(symbols)} | slots={self.slots.used}/{self.cfg.max_slots}")
-                        await asyncio.sleep(2)
+                    BATCH = 5
+                    async with aiohttp.ClientSession() as session:
+                        for i in range(0, len(symbols), BATCH):
+                            batch   = symbols[i:i+BATCH]
+                            tasks   = [
+                                self._process_candidate(session, sym, initial_balance)
+                                for sym in batch
+                            ]
+                            await asyncio.gather(*tasks, return_exceptions=True)
+                            checked = i + len(batch)
+                            if checked % 50 == 0:
+                                _log(f"[Scan] {checked}/{len(symbols)} | slots={self.slots.used}/{self.cfg.max_slots}")
+                            await asyncio.sleep(2)
 
-            except Exception as e:
-                _log(f"❌ Scan error: {e}")
+                except Exception as e:
+                    _log(f"❌ Scan error: {e}")
+            else:
+                _log("[Scanner] رصيد غير كافٍ — البحث عن فرص موقوف. المراقبة نشطة.")
 
             elapsed = (datetime.now() - start).seconds // 60
             _log(f"✅ Cycle: {elapsed}m | slots={self.slots.used}/{self.cfg.max_slots}")
             await asyncio.sleep(self.cfg.scan_interval * 60)
 
     async def run(self):
+        # استرداد الصفقات المفتوحة قبل بدء المراقبة
+        self._restore_open_positions()
         await asyncio.gather(self.scan_loop(), self.monitor.start())
 
 
