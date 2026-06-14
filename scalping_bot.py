@@ -50,7 +50,8 @@ class Config:
     max_trade_hours:    float = field(default_factory=lambda: float(os.environ.get("MAX_TRADE_DURATION_HOURS", "10")))
     extension_hours:    float = 3.0
     reconcile_interval: int   = field(default_factory=lambda: int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "180")))
-    sl_retry_attempts:  int   = 3
+    sl_retry_attempts:        int   = 3
+    disable_timeout_liquidation: bool = field(default_factory=lambda: os.environ.get("DISABLE_TIME_OUT_LIQUIDATION", "true").lower() == "true")
     blacklisted_assets: set   = field(default_factory=lambda: {
         "AAVE", "COMP", "MKR", "CRV", "LDO", "UNI", "SUSHI", "BAL",
         "CAKE", "YFI", "SNX", "DYDX", "ANC", "FUN", "WIN", "DICE",
@@ -567,7 +568,21 @@ class HighSpeedExecutor:
             ids["tp1_order_id"] = o["id"]
             _log(f"✅ TP1: {tp1_price:.8g} ×{full_qty} ID:{o['id']}")
         except Exception as e:
-            _log(f"❌ TP1 FAILED {symbol}: {e}")
+            err = str(e)
+            if "30005" in err or "Oversold" in err or "oversold" in err:
+                # TP price exceeds deviation limit — compress to +2.5% max
+                _log(f"[TP1 30005] {symbol}: compressing TP to +2.5%")
+                try:
+                    compressed_tp = float(self.exchange.price_to_precision(
+                        symbol, filled_price * 1.025
+                    ))
+                    o = self.exchange.create_limit_sell_order(symbol, full_qty, compressed_tp)
+                    ids["tp1_order_id"] = o["id"]
+                    _log(f"✅ TP1 (compressed +2.5%): {compressed_tp:.8g} ×{full_qty} ID:{o['id']}")
+                except Exception as e2:
+                    _log(f"❌ TP1 compressed FAILED {symbol}: {e2}")
+            else:
+                _log(f"❌ TP1 FAILED {symbol}: {err[:100]}")
 
         # SL is virtual — stored in slot, not sent to exchange
         _log(
@@ -799,21 +814,40 @@ class TradeMonitor:
         # Shadow SL: SL is virtual — only check TP1 presence on exchange
         tp_active = bool(state.tp1_order_id and state.tp1_order_id in open_order_ids)
 
-        # Orphaned = no TP1 on exchange (SL absence is expected — it's virtual)
+        # Shadow SL: SL absence is EXPECTED — only TP1 matters
         orphaned_no_exits = not tp_active
-        orphaned_timeout  = age_hrs >= self.cfg.max_trade_hours and not state.extended
+
+        # Timeout logic — respects disable flag and profit/RSI shields
+        orphaned_timeout = False
+        if not self.cfg.disable_timeout_liquidation:
+            if age_hrs >= self.cfg.max_trade_hours and not state.extended:
+                # ── Condition A: Profit Shield — price above entry → extend ──
+                try:
+                    ticker     = await asyncio.get_running_loop().run_in_executor(
+                        None, self.executor.exchange.fetch_ticker, symbol
+                    )
+                    curr_price = float(ticker.get("last") or ticker.get("close") or 0)
+                    if curr_price > 0 and curr_price > state.entry_price:
+                        _log(
+                            f"[Timeout Shield A] {symbol}: curr={curr_price:.8g} > "
+                            f"entry={state.entry_price:.8g} — floating profit, extending indefinitely"
+                        )
+                        self.slots.update_state(symbol, extended=True)
+                    else:
+                        # ── Condition B: RSI Momentum Shield ──
+                        rsi_ok = await self._check_rsi_momentum(symbol)
+                        if rsi_ok:
+                            _log(f"[Timeout Shield B] {symbol}: RSI bounce detected — extending")
+                            self.slots.update_state(symbol, extended=True)
+                        else:
+                            orphaned_timeout = True
+                except Exception as e:
+                    _log(f"[Timeout Shield] {symbol}: price check failed: {e}")
+                    orphaned_timeout = True
 
         if not orphaned_no_exits and not orphaned_timeout:
             _log(f"[Reconcile] ✅ {symbol}: TP={'✅' if tp_active else '❌'} SL=برمجائي age={age_hrs:.1f}h")
             return
-
-        # ── Timeout: check if extension warranted ──
-        if orphaned_timeout and not orphaned_no_exits:
-            extended = await self._check_extension_eligibility(symbol, state)
-            if extended:
-                self.slots.update_state(symbol, extended=True)
-                _log(f"[Reconcile] ⏳ {symbol}: تمديد 3 ساعات بسبب إشارات إيجابية")
-                return
 
         reason_parts = []
         if orphaned_no_exits: reason_parts.append("لا توجد أوامر TP/SL نشطة على المنصة")
@@ -914,6 +948,29 @@ class TradeMonitor:
                 f"• <b>العملة:</b> <code>{symbol}</code>\n"
                 "• فشل البيع الطارئ — تدخل يدوي عاجل مطلوب!"
             )
+
+    async def _check_rsi_momentum(self, symbol: str) -> bool:
+        """Returns True if 15m RSI > 35 (upward bounce from oversold)."""
+        try:
+            ohlcv = await asyncio.get_running_loop().run_in_executor(
+                None,
+                self.executor.exchange.fetch_ohlcv,
+                symbol, "15m", None, 20,
+            )
+            if not ohlcv or len(ohlcv) < 15:
+                return False
+            import pandas as pd
+            closes = pd.Series([c[4] for c in ohlcv], dtype=float)
+            delta  = closes.diff()
+            gain   = delta.clip(lower=0).rolling(14).mean()
+            loss   = (-delta.clip(upper=0)).rolling(14).mean()
+            rs     = gain / loss.replace(0, 1e-9)
+            rsi    = float((100 - 100 / (1 + rs)).iloc[-1])
+            _log(f"[RSI Momentum] {symbol}: 15m RSI={rsi:.1f}")
+            return rsi > 35
+        except Exception as e:
+            _log(f"[RSI Momentum] {symbol}: {e}")
+            return False
 
     async def _check_extension_eligibility(self, symbol: str, state: SlotState) -> bool:
         """
@@ -1132,6 +1189,23 @@ class ScalpingOrchestrator:
             _log(f"[L3] {symbol}: price=0 — abort")
             return
 
+        # ── Inline Balance Guard — check free USDT immediately before trade ──
+        try:
+            bal_check = self.executor.exchange.fetch_balance({"type": "spot"})
+            free_usdt = float(
+                bal_check.get("USDT", {}).get("free", 0) or
+                bal_check.get("free", {}).get("USDT", 0)
+            )
+            if free_usdt < self.cfg.capital:
+                _log(
+                    f"[Local Balance Guard] Free USDT (${free_usdt:.2f}) drops below "
+                    f"trade capital size (${self.cfg.capital:.2f}). "
+                    f"Aborting further batch execution locally."
+                )
+                return  # silent — no Telegram
+        except Exception as e:
+            _log(f"[Inline Balance Guard] fetch failed: {e}")
+
         # ── Layer 3: Execute ──
         state = await asyncio.get_running_loop().run_in_executor(
             None, self.executor.execute_full_trade,
@@ -1140,7 +1214,7 @@ class ScalpingOrchestrator:
         )
 
         if not state:
-            # Silent failure — no Telegram spam, log only
+            # Silent failure — no Telegram spam
             _log(f"[L3 ❌] {symbol}: execution failed — silent cooldown")
             return
 
