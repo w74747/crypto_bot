@@ -1237,11 +1237,29 @@ class ScalpingOrchestrator:
                 if asset in ("USDT", "USDC") or float(total_qty or 0) <= 0:
                     continue
 
+                # ── تجاهل الأصول المحظورة شرعياً ──
+                if asset.upper() in self.cfg.blacklisted_assets:
+                    _log(f"[Restore] ⛔ {asset} في قائمة الحظر — تجاهل")
+                    continue
+
+                # ── تجاهل Leveraged tokens ──
+                if any(asset.upper().endswith(p) for p in ["3L","3S","5L","5S","UP","DOWN"]):
+                    _log(f"[Restore] ⛔ {asset} leveraged token — تجاهل")
+                    continue
+
+                # ── احترام حد الـ slots ──
+                if self.slots.used >= self.cfg.max_slots:
+                    _log(
+                        f"[Restore] وصل الحد الأقصى {self.cfg.max_slots} slots "
+                        f"— إيقاف الاسترداد"
+                    )
+                    break
+
                 symbol = f"{asset}/USDT"
                 if symbol not in self.executor.exchange.markets:
                     continue
 
-                # جلب الأوامر المفتوحة لهذا الزوج
+                # جلب الأوامر المفتوحة
                 try:
                     open_orders = self.executor.exchange.fetch_open_orders(symbol)
                 except Exception:
@@ -1251,17 +1269,21 @@ class ScalpingOrchestrator:
                 if not limit_sells:
                     continue
 
-                # حساب سعر الدخول التقريبي من أول Limit Sell
                 tp1_order  = limit_sells[0]
                 tp1_price  = float(tp1_order.get("price", 0))
                 filled_qty = float(total_qty)
 
-                # سعر الدخول التقريبي — أقل من TP1 بنسبة معقولة
-                approx_entry = tp1_price / 1.03 if tp1_price > 0 else 0
-                approx_sl    = approx_entry * 0.92 if approx_entry > 0 else 0
+                # سعر الدخول التقريبي
+                approx_entry = tp1_price / 1.05 if tp1_price > 0 else 0
+                approx_sl    = approx_entry * 0.95 if approx_entry > 0 else 0
 
                 if approx_entry <= 0 or filled_qty <= 0:
                     continue
+
+                # إعادة بناء الـ qty split (30/20/20)
+                qty_tp1 = round(filled_qty * 0.30, 6)
+                qty_tp2 = round(filled_qty * 0.20, 6)
+                qty_tp3 = round(filled_qty * 0.20, 6)
 
                 state = SlotState(
                     symbol       = symbol,
@@ -1270,9 +1292,13 @@ class ScalpingOrchestrator:
                     entry_price  = approx_entry,
                     filled_qty   = filled_qty,
                     tp1          = tp1_price,
-                    tp2          = tp1_price * 1.03,
-                    tp3          = tp1_price * 1.06,
+                    tp2          = tp1_price * 1.04,   # Fib تقريبي
+                    tp3          = tp1_price * 1.08,   # Fib تقريبي
                     stop_loss    = approx_sl,
+                    qty_tp1      = qty_tp1,
+                    qty_tp2      = qty_tp2,
+                    qty_tp3      = qty_tp3,
+                    entry_time   = time.time(),
                 )
                 self.slots.occupy(state)
                 restored += 1
