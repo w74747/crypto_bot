@@ -60,6 +60,18 @@ class Config:
     })
 
 
+def _format_duration(start_time: float) -> str:
+    """Formats elapsed seconds into Arabic-friendly h/m/s string."""
+    elapsed = int(time.time() - start_time)
+    h, rem  = divmod(elapsed, 3600)
+    m, s    = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    elif m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
 MEXC_HEADER = "\U0001f7e6 <b>\u0627\u0644\u0645\u0646\u0635\u0629: MEXC</b>\n"
 
 
@@ -79,6 +91,15 @@ class SlotState:
     tp3:                  float = 0.0
     stop_loss:            float = 0.0
     entry_fee:            float = 0.0   # Taker 0.1% on market buy
+    # Quantity split: 30% TP1 (exchange), 20% TP2 (shadow), 20% TP3 (shadow), 30% SL
+    qty_tp1:              float = 0.0
+    qty_tp2:              float = 0.0
+    qty_tp3:              float = 0.0
+    # Lifecycle flags
+    tp1_filled:           bool  = False
+    tp2_filled:           bool  = False
+    tp3_filled:           bool  = False
+    entry_time:           float = field(default_factory=time.time)  # ms precision
     opened_at:            float = field(default_factory=time.time)
     break_even_attempted: bool  = False
     extended:             bool  = False
@@ -466,7 +487,10 @@ class ConsensusCommittee:
 # ─────────────────────────────────────────────
 # 7. HIGH SPEED EXECUTOR
 # ─────────────────────────────────────────────
-TP1_QTY_PCT = 1.0   # 100% at TP1 — monolithic to avoid 30005
+# Inverted Pyramid Split: 30% TP1 exchange | 20% TP2 shadow | 20% TP3 shadow | 30% SL shadow
+TP1_QTY_PCT = 0.30
+TP2_QTY_PCT = 0.20
+TP3_QTY_PCT = 0.20
 
 
 class HighSpeedExecutor:
@@ -567,17 +591,24 @@ class HighSpeedExecutor:
         Benefit: no concurrent TP+SL double-booking → zero code 30005/30087
         """
         ids: dict = {}
-        full_qty  = self._apply_step_size(symbol, filled_qty)
+
+        # Hybrid split: only 30% goes to exchange as TP1 limit
+        qty_tp1 = self._apply_step_size(symbol, filled_qty * 0.30)
+        qty_tp2 = self._apply_step_size(symbol, filled_qty * 0.20)
+        qty_tp3 = self._apply_step_size(symbol, filled_qty * 0.20)
+        ids["qty_tp1"] = qty_tp1
+        ids["qty_tp2"] = qty_tp2
+        ids["qty_tp3"] = qty_tp3
 
         # ── Post-buy settle: give MEXC time to credit tokens ──
         time.sleep(2)
 
-        # ── TP1 Limit Sell — 100% qty with full fault tolerance ──
+        # ── TP1 Limit Sell — 30% qty only ──
         try:
             tp1_price = float(self.exchange.price_to_precision(symbol, tp1))
-            o = self.exchange.create_limit_sell_order(symbol, full_qty, tp1_price)
+            o = self.exchange.create_limit_sell_order(symbol, qty_tp1, tp1_price)
             ids["tp1_order_id"] = o["id"]
-            _log(f"✅ TP1: {tp1_price:.8g} ×{full_qty} ID:{o['id']}")
+            _log(f"✅ TP1 (30%): {tp1_price:.8g} ×{qty_tp1} ID:{o['id']}")
         except ccxt.NetworkError as e:
             _log(f"[TP1] NetworkError {symbol}: {e} — will retry on next reconcile")
         except ccxt.ExchangeError as e:
@@ -589,7 +620,7 @@ class HighSpeedExecutor:
                     compressed_tp = float(self.exchange.price_to_precision(
                         symbol, filled_price * 1.025
                     ))
-                    o = self.exchange.create_limit_sell_order(symbol, full_qty, compressed_tp)
+                    o = self.exchange.create_limit_sell_order(symbol, qty_tp1, compressed_tp)
                     ids["tp1_order_id"] = o["id"]
                     _log(f"✅ TP1 compressed (+2.5%): {compressed_tp:.8g} ×{full_qty} ID:{o['id']}")
                 except ccxt.ExchangeError as e2:
@@ -601,7 +632,7 @@ class HighSpeedExecutor:
                             final_tp = float(self.exchange.price_to_precision(
                                 symbol, filled_price * 1.02
                             ))
-                            o = self.exchange.create_limit_sell_order(symbol, full_qty, final_tp)
+                            o = self.exchange.create_limit_sell_order(symbol, qty_tp1, final_tp)
                             ids["tp1_order_id"] = o["id"]
                             _log(f"✅ TP1 final (+2.0%): {final_tp:.8g} ID:{o['id']}")
                         except Exception as e3:
@@ -723,16 +754,27 @@ class HighSpeedExecutor:
         # Entry fee: 0.1% taker on market buy
         entry_fee = self.cfg.capital * 0.001
 
+        # Enforce minimum +5% floor on TP1
+        effective_tp1 = max(tp1, buy["filled_price"] * 1.05)
+        if effective_tp1 != tp1:
+            _log(f"[Hybrid] {symbol}: TP1 lifted from {tp1:.8g} → {effective_tp1:.8g} (floor +5%)")
+
         return SlotState(
             symbol       = symbol,
             buy_order_id = buy["order_id"],
             tp1_order_id = bracket.get("tp1_order_id", ""),
-            sl_order_id  = "",  # Shadow SL — not placed on exchange
+            sl_order_id  = "",
             entry_price  = buy["filled_price"],
             filled_qty   = buy["filled_qty"],
-            tp1=tp1, tp2=tp2, tp3=tp3,
+            tp1          = effective_tp1,
+            tp2          = tp2,
+            tp3          = tp3,
             stop_loss    = stop_loss,
             entry_fee    = entry_fee,
+            qty_tp1      = bracket.get("qty_tp1", buy["filled_qty"] * 0.30),
+            qty_tp2      = bracket.get("qty_tp2", buy["filled_qty"] * 0.20),
+            qty_tp3      = bracket.get("qty_tp3", buy["filled_qty"] * 0.20),
+            entry_time   = time.time(),
         )
 
 
@@ -768,60 +810,124 @@ class TradeMonitor:
 
     async def _check_slot(self, state: SlotState):
         symbol = state.symbol
+        loop   = asyncio.get_running_loop()
 
-        # ── Shadow SL Monitor — fetch live price and compare to virtual SL ──
-        if state.stop_loss > 0:
-            try:
-                ticker     = await asyncio.get_running_loop().run_in_executor(
-                    None, self.executor.exchange.fetch_ticker, symbol
-                )
-                curr_price = float(ticker.get("last") or ticker.get("close") or 0)
+        # ── Fetch live price once — used for SL + shadow TP checks ──
+        curr_price = 0.0
+        try:
+            ticker     = await loop.run_in_executor(
+                None, self.executor.exchange.fetch_ticker, symbol
+            )
+            curr_price = float(ticker.get("last") or ticker.get("close") or 0)
+        except Exception as e:
+            _log(f"[Monitor] price fetch failed {symbol}: {e}")
+            return
 
-                if curr_price > 0 and curr_price <= state.stop_loss:
-                    _log(
-                        f"[Shadow SL] 🛑 {symbol}: curr={curr_price:.8g} "
-                        f"≤ SL={state.stop_loss:.8g} — bypass trigger!"
+        if curr_price <= 0:
+            return
+
+        # ── Shadow SL Monitor ──
+        if state.stop_loss > 0 and curr_price <= state.stop_loss:
+            _log(
+                f"[Shadow SL] 🛑 {symbol}: curr={curr_price:.8g} "
+                f"≤ SL={state.stop_loss:.8g} — liquidating remaining qty"
+            )
+            # Cancel any open TP1 to free locked qty
+            if state.tp1_order_id and not state.tp1_filled:
+                try:
+                    await loop.run_in_executor(
+                        None, self.executor.exchange.cancel_all_orders, symbol
                     )
-                    # Cancel all TP orders to release locked qty
-                    try:
-                        await asyncio.get_running_loop().run_in_executor(
-                            None,
-                            self.executor.exchange.cancel_all_orders,
-                            symbol,
-                        )
-                        _log(f"[Shadow SL] {symbol}: TP orders cancelled")
-                    except ccxt.NetworkError as e:
-                        _log(f"[Shadow SL] NetworkError cancel {symbol}: {e}")
-                    except ccxt.ExchangeError as e:
-                        _log(f"[Shadow SL] ExchangeError cancel {symbol}: {e}")
-                    except Exception as e:
-                        _log(f"[Shadow SL] cancel_all failed {symbol}: {e}")
+                    _log(f"[Shadow SL] {symbol}: TP1 cancelled")
+                except Exception as e:
+                    _log(f"[Shadow SL] cancel failed {symbol}: {e}")
+                await asyncio.sleep(0.5)
 
-                    await asyncio.sleep(0.5)
+            # Sell remaining (qty_tp2 + qty_tp3 not yet sold)
+            remaining = 0.0
+            if not state.tp2_filled: remaining += state.qty_tp2
+            if not state.tp3_filled: remaining += state.qty_tp3
+            if state.tp1_filled is False:  remaining += state.qty_tp1
+            if remaining <= 0:
+                remaining = state.filled_qty
 
-                    # Full market sell of free balance
-                    liquidated = await asyncio.get_running_loop().run_in_executor(
-                        None, self.executor.emergency_market_sell,
-                        symbol, state.filled_qty
-                    )
-                    self.slots.release(symbol)
-                    await self._notify_exit(state, "SL", curr_price)
-                    return
+            await loop.run_in_executor(
+                None, self.executor.emergency_market_sell, symbol, remaining
+            )
+            self.slots.release(symbol)
+            await self._notify_exit(state, "SL", curr_price, state.qty_tp1 + state.qty_tp2 + state.qty_tp3)
+            return
 
-            except Exception as e:
-                _log(f"[Shadow SL] price fetch failed {symbol}: {e}")
-
-        # ── TP1 fill check ──
-        if state.tp1_order_id and not state.break_even_attempted:
-            tp1_status = await asyncio.get_running_loop().run_in_executor(
+        # ── TP1 Physical Fill Check ──
+        if state.tp1_order_id and not state.tp1_filled:
+            tp1_status = await loop.run_in_executor(
                 None, self.executor.fetch_order_status, symbol, state.tp1_order_id
             )
             if tp1_status == "closed":
-                _log(f"[Monitor] 🎯 TP1 HIT: {symbol}")
-                self.slots.update_state(symbol, break_even_attempted=True)
+                duration = _format_duration(state.entry_time)
+                _log(f"[Monitor] 🎯 TP1 HIT: {symbol} | ⏳ {duration}")
+                self.slots.update_state(symbol, tp1_filled=True, break_even_attempted=True)
+                await self._notify_exit(state, "TP1", state.tp1, state.qty_tp1)
+
+        # ── Shadow TP2 Monitor (Fibonacci dynamic) ──
+        if state.tp1_filled and not state.tp2_filled and curr_price >= state.tp2:
+            _log(f"[Shadow TP2] 🎯 {symbol}: curr={curr_price:.8g} ≥ TP2={state.tp2:.8g}")
+            duration = _format_duration(state.entry_time)
+
+            # Cancel remaining TP1 if somehow still open (safety), then sell TP2
+            try:
+                open_orders = await loop.run_in_executor(
+                    None, self.executor.exchange.fetch_open_orders, symbol
+                )
+                for o in open_orders:
+                    if str(o.get("id")) == str(state.tp1_order_id):
+                        await loop.run_in_executor(
+                            None, self.executor.exchange.cancel_order, o["id"], symbol
+                        )
+                        await asyncio.sleep(1.5)
+            except Exception as e:
+                _log(f"[Shadow TP2] cancel check {symbol}: {e}")
+
+            tp2_qty = self.executor._apply_step_size(symbol, state.qty_tp2)
+            try:
+                tp2_precise_price = float(
+                    self.executor.exchange.price_to_precision(symbol, state.tp2)
+                )
+                o = await loop.run_in_executor(
+                    None,
+                    lambda: self.executor.exchange.create_limit_sell_order(
+                        symbol, tp2_qty, tp2_precise_price
+                    )
+                )
+                _log(f"[Shadow TP2] ✅ {symbol}: {tp2_qty} @ {tp2_precise_price:.8g} ID:{o['id']} ⏳{duration}")
+                self.slots.update_state(symbol, tp2_filled=True)
+                await self._notify_exit(state, "TP2", curr_price, state.qty_tp2)
+            except Exception as e:
+                _log(f"[Shadow TP2] sell failed {symbol}: {e}")
+
+        # ── Shadow TP3 Monitor (Fibonacci dynamic) ──
+        if state.tp2_filled and not state.tp3_filled and curr_price >= state.tp3:
+            _log(f"[Shadow TP3] 🎯 {symbol}: curr={curr_price:.8g} ≥ TP3={state.tp3:.8g}")
+            duration = _format_duration(state.entry_time)
+
+            tp3_qty = self.executor._apply_step_size(symbol, state.qty_tp3)
+            try:
+                tp3_precise_price = float(
+                    self.executor.exchange.price_to_precision(symbol, state.tp3)
+                )
+                o = await loop.run_in_executor(
+                    None,
+                    lambda: self.executor.exchange.create_limit_sell_order(
+                        symbol, tp3_qty, tp3_precise_price
+                    )
+                )
+                _log(f"[Shadow TP3] ✅ {symbol}: {tp3_qty} @ {tp3_precise_price:.8g} ID:{o['id']} ⏳{duration}")
+                self.slots.update_state(symbol, tp3_filled=True)
+                await self._notify_exit(state, "TP3", curr_price, state.qty_tp3)
+                # All targets hit — release slot
                 self.slots.release(symbol)
-                await self._notify_exit(state, "TP1", state.tp1)
-                return
+            except Exception as e:
+                _log(f"[Shadow TP3] sell failed {symbol}: {e}")
 
     async def _reconcile_portfolio(self):
         """
@@ -1021,34 +1127,60 @@ class TradeMonitor:
             _log(f"[Extension] {symbol}: {e}")
         return False
 
-    async def _notify_exit(self, state: SlotState, exit_type: str, exit_price: float):
+    async def _notify_exit(
+        self,
+        state:      SlotState,
+        exit_type:  str,
+        exit_price: float,
+        split_qty:  float = 0.0,
+    ):
         entry      = state.entry_price
-        filled_qty = state.filled_qty
-        entry_fee  = state.entry_fee  # 0.1% taker paid at buy
+        # Use split_qty if provided (partial exit), else full qty
+        exit_qty   = split_qty if split_qty > 0 else state.filled_qty
+        entry_fee  = state.entry_fee  # 0.1% taker paid at buy (pro-rated to split)
+        entry_fee_split = entry_fee * (exit_qty / state.filled_qty) if state.filled_qty > 0 else entry_fee
 
-        # Exit fee: 0% maker for TP limit, 0.1% taker for SL market sell
+        # Exit fee: 0% maker for TP1 limit, 0.1% taker for shadow/SL market
         if exit_type == "TP1":
-            exit_fee = 0.0   # Maker order — zero fee on MEXC
+            exit_fee = 0.0
         else:
-            exit_fee = (exit_price * filled_qty) * 0.001  # Taker 0.1%
+            exit_fee = (exit_price * exit_qty) * 0.001
 
-        gross_pnl_usd  = (exit_price - entry) * filled_qty
-        total_fees_usd = entry_fee + exit_fee
+        gross_pnl_usd  = (exit_price - entry) * exit_qty
+        total_fees_usd = entry_fee_split + exit_fee
         net_pnl_usd    = gross_pnl_usd - total_fees_usd
-        net_pnl_pct    = (net_pnl_usd / (entry * filled_qty)) * 100 if entry > 0 else 0.0
+        net_pnl_pct    = (net_pnl_usd / (entry * exit_qty)) * 100 if entry > 0 and exit_qty > 0 else 0.0
 
-        emoji = "✅" if net_pnl_usd >= 0 else "🔴"
-        label = "🎯 TP1 وصل الهدف" if exit_type == "TP1" else "🛑 وقف الخسارة (Shadow SL)"
+        emoji     = "✅" if net_pnl_usd >= 0 else "🔴"
+        sign_pnl  = "+" if net_pnl_usd >= 0 else ""
+        sign_pct  = "+" if net_pnl_pct >= 0 else ""
+        duration  = _format_duration(state.entry_time)
 
-        sign_pnl = "+" if net_pnl_usd >= 0 else ""
-        sign_pct = "+" if net_pnl_pct >= 0 else ""
+        labels = {
+            "TP1": "🎯 TP1 وصل الهدف (30% — منصة)",
+            "TP2": "🎯 TP2 وصل الهدف (20% — برمجائي)",
+            "TP3": "🏆 TP3 وصل الهدف (20% — برمجائي)",
+            "SL":  "🛑 وقف الخسارة (Shadow SL)",
+        }
+        label = labels.get(exit_type, f"📌 {exit_type}")
+
+        tp1_pct = (state.tp1 / entry - 1) * 100 if entry > 0 else 0
+        tp2_pct = (state.tp2 / entry - 1) * 100 if entry > 0 else 0
+        tp3_pct = (state.tp3 / entry - 1) * 100 if entry > 0 else 0
+        sl_pct  = (1 - state.stop_loss / entry) * 100 if entry > 0 else 0
 
         await self._notify(
             f"{label}\n\n"
             f"• <b>العملة:</b> <code>{state.symbol}</code>\n"
             f"• <b>سعر الدخول:</b> <code>{entry:.8g}</code>"
             f" | <b>سعر الخروج:</b> <code>{exit_price:.8g}</code>\n"
-            f"• <b>الكمية:</b> <code>{filled_qty:.6f}</code>\n"
+            f"• <b>الكمية المُنفَّذة:</b> <code>{exit_qty:.6f}</code>\n\n"
+            f"• <b>رأس المال المخصص للشراء:</b> <code>${self.cfg.capital:.2f}</code>\n"
+            f"• هدف المنصة TP1: <code>+{tp1_pct:.1f}%</code> (معلق رسمياً — 30% من الكمية)\n"
+            f"• هدف برمجائي TP2: <code>+{tp2_pct:.1f}%</code> (فيبوناتشي ديناميكي — 20%)\n"
+            f"• هدف برمجائي TP3: <code>+{tp3_pct:.1f}%</code> (فيبوناتشي ديناميكي — 20%)\n"
+            f"• SL برمجائي: <code>-{sl_pct:.1f}%</code> (30% متبقي)\n\n"
+            f"• <b>الوقت المستغرق للهدف:</b> ⏳ <code>{duration}</code>\n"
             f"• <b>رسوم المنصة الإجمالية:</b> <code>${total_fees_usd:.4f}</code>\n"
             f"• <b>النتيجة الصافية الحقيقية:</b> {emoji} "
             f"<b>${sign_pnl}{net_pnl_usd:.3f} ({sign_pct}{net_pnl_pct:.2f}%)</b>"
@@ -1361,13 +1493,16 @@ class ScalpingOrchestrator:
             "🚀 <b>تم التنفيذ</b>\n\n"
             f"• <b>العملة:</b> <code>{symbol}</code>\n"
             f"• <b>سعر الدخول:</b> <code>{state.entry_price:.8g}</code>\n"
-            f"• <b>الكمية:</b> <code>{state.filled_qty:.6f}</code>\n"
-            f"• <b>رأس المال:</b> <code>${self.cfg.capital:.2f}</code>\n\n"
-            f"<b>الأهداف</b>\n"
-            f"• TP1: <code>{state.tp1:.8g}</code>  (+{tp1_pct:.1f}%) — 100%\n"
-            f"• TP2: <code>{state.tp2:.8g}</code>  (+{tp2_pct:.1f}%) — مرجعي\n"
-            f"• TP3: <code>{state.tp3:.8g}</code>  (+{tp3_pct:.1f}%) — مرجعي\n"
-            f"• SL:  <code>{state.stop_loss:.8g}</code>  (-{sl_pct:.1f}%) (برمجائي صامت)\n\n"
+            f"• <b>الكمية الكلية:</b> <code>{state.filled_qty:.6f}</code>\n"
+            f"• <b>رأس المال المخصص للشراء:</b> <code>${self.cfg.capital:.2f}</code>\n\n"
+            f"<b>هيكل الأهداف الهجين</b>\n"
+            f"• هدف المنصة TP1: <code>{state.tp1:.8g}</code> (+{tp1_pct:.1f}%)"
+            f"  — 30% ({state.qty_tp1:.4f}) ✅ معلق رسمياً\n"
+            f"• هدف برمجائي TP2: <code>{state.tp2:.8g}</code> (+{tp2_pct:.1f}%)"
+            f"  — 20% ({state.qty_tp2:.4f}) (فيبوناتشي ديناميكي)\n"
+            f"• هدف برمجائي TP3: <code>{state.tp3:.8g}</code> (+{tp3_pct:.1f}%)"
+            f"  — 20% ({state.qty_tp3:.4f}) (فيبوناتشي ديناميكي)\n"
+            f"• SL برمجائي: <code>{state.stop_loss:.8g}</code> (-{sl_pct:.1f}%) (30% متبقي)\n\n"
             f"• <b>الرصيد الافتتاحي:</b> <code>${initial_balance:.2f}</code>\n"
             f"• <b>الرصيد الحالي:</b>    <code>${current_balance:.2f}</code>\n\n"
             f"• <b>Committee:</b> DeepSeek={result['ds_vote']} Llama={result['llama_vote']}\n"
