@@ -51,7 +51,7 @@ class Config:
     extension_hours:    float = 3.0
     reconcile_interval: int   = field(default_factory=lambda: int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "180")))
     sl_retry_attempts:        int   = 3
-    disable_timeout_liquidation: bool = field(default_factory=lambda: os.environ.get("DISABLE_TIME_OUT_LIQUIDATION", "true").lower() == "true")
+    disable_timeout_liquidation: bool = True  # Positions run until TP or Shadow SL — no time-based liquidation
     blacklisted_assets: set   = field(default_factory=lambda: {
         "AAVE", "COMP", "MKR", "CRV", "LDO", "UNI", "SUSHI", "BAL",
         "CAKE", "YFI", "SNX", "DYDX", "ANC", "FUN", "WIN", "DICE",
@@ -78,6 +78,7 @@ class SlotState:
     tp2:                  float = 0.0
     tp3:                  float = 0.0
     stop_loss:            float = 0.0
+    entry_fee:            float = 0.0   # Taker 0.1% on market buy
     opened_at:            float = field(default_factory=time.time)
     break_even_attempted: bool  = False
     extended:             bool  = False
@@ -319,10 +320,11 @@ def calculate_micro_swing_sl(exchange: ccxt.mexc, symbol: str, entry_price: floa
         local_low = min(swing_lows[-3:]) if swing_lows else float(lows[-5:].min())
         sl = local_low * 0.998
     except Exception as e:
-        _log(f"[SL Calc] {symbol} fallback: {e}")
-        sl = entry_price * 0.975
+        _log(f"[SL Calc] {symbol} fallback 5%: {e}")
+        sl = entry_price * 0.95
 
-    sl = max(entry_price * 0.975, min(sl, entry_price * 0.995))
+    # Enforce strict 5% max risk below entry
+    sl = max(entry_price * 0.95, min(sl, entry_price * 0.995))
     return sl
 
 
@@ -525,8 +527,13 @@ class HighSpeedExecutor:
         _log(f"[Executor] BUY {symbol} | signal={entry_price:.8g} live={live_price:.8g} ${capital:.2f}")
         try:
             self._ensure_markets()
+            # Apply exchange precision to capital amount
+            try:
+                precise_capital = float(self.exchange.cost_to_precision(symbol, capital))
+            except Exception:
+                precise_capital = capital
             order = self.exchange.create_market_buy_order(
-                symbol, capital, {"quoteOrderQty": capital}
+                symbol, precise_capital, {"quoteOrderQty": precise_capital}
             )
             filled_price = float(order.get("average") or order.get("price") or live_price)
             filled_qty   = float(order.get("filled") or (capital / filled_price))
@@ -534,6 +541,10 @@ class HighSpeedExecutor:
             return {"order_id": order["id"], "filled_price": filled_price, "filled_qty": filled_qty}
         except ccxt.InsufficientFunds as e:
             _log(f"[Executor] InsufficientFunds {symbol}: {e}")
+        except ccxt.NetworkError as e:
+            _log(f"[Executor] NetworkError {symbol}: {e} — retry next cycle")
+        except ccxt.ExchangeError as e:
+            _log(f"[Executor] ExchangeError {symbol}: {e}")
         except Exception as e:
             _log(f"[Executor] ERROR {symbol}: {e}")
         return None
@@ -561,28 +572,50 @@ class HighSpeedExecutor:
         # ── Post-buy settle: give MEXC time to credit tokens ──
         time.sleep(2)
 
-        # ── TP1 Limit Sell — 100% qty ──
+        # ── TP1 Limit Sell — 100% qty with full fault tolerance ──
         try:
             tp1_price = float(self.exchange.price_to_precision(symbol, tp1))
             o = self.exchange.create_limit_sell_order(symbol, full_qty, tp1_price)
             ids["tp1_order_id"] = o["id"]
             _log(f"✅ TP1: {tp1_price:.8g} ×{full_qty} ID:{o['id']}")
-        except Exception as e:
+        except ccxt.NetworkError as e:
+            _log(f"[TP1] NetworkError {symbol}: {e} — will retry on next reconcile")
+        except ccxt.ExchangeError as e:
             err = str(e)
             if "30005" in err or "Oversold" in err or "oversold" in err:
-                # TP price exceeds deviation limit — compress to +2.5% max
-                _log(f"[TP1 30005] {symbol}: compressing TP to +2.5%")
+                # TP exceeds MEXC deviation boundary — compress to +2.5%
+                _log(f"[TP1 30005] {symbol}: compressing target to +2.5% from fill")
                 try:
                     compressed_tp = float(self.exchange.price_to_precision(
                         symbol, filled_price * 1.025
                     ))
                     o = self.exchange.create_limit_sell_order(symbol, full_qty, compressed_tp)
                     ids["tp1_order_id"] = o["id"]
-                    _log(f"✅ TP1 (compressed +2.5%): {compressed_tp:.8g} ×{full_qty} ID:{o['id']}")
+                    _log(f"✅ TP1 compressed (+2.5%): {compressed_tp:.8g} ×{full_qty} ID:{o['id']}")
+                except ccxt.ExchangeError as e2:
+                    err2 = str(e2)
+                    if "30005" in err2 or "Oversold" in err2:
+                        # Final fallback: +2.0%
+                        _log(f"[TP1 30005] {symbol}: 2nd compression to +2.0%")
+                        try:
+                            final_tp = float(self.exchange.price_to_precision(
+                                symbol, filled_price * 1.02
+                            ))
+                            o = self.exchange.create_limit_sell_order(symbol, full_qty, final_tp)
+                            ids["tp1_order_id"] = o["id"]
+                            _log(f"✅ TP1 final (+2.0%): {final_tp:.8g} ID:{o['id']}")
+                        except Exception as e3:
+                            _log(f"❌ TP1 all compressions failed {symbol}: {e3}")
+                    else:
+                        _log(f"❌ TP1 compressed FAILED {symbol}: {e2}")
                 except Exception as e2:
                     _log(f"❌ TP1 compressed FAILED {symbol}: {e2}")
+            elif "30087" in err:
+                _log(f"[TP1 30087] {symbol}: price out of range — {err[:80]}")
             else:
-                _log(f"❌ TP1 FAILED {symbol}: {err[:100]}")
+                _log(f"❌ TP1 ExchangeError {symbol}: {err[:100]}")
+        except Exception as e:
+            _log(f"❌ TP1 FAILED {symbol}: {str(e)[:100]}")
 
         # SL is virtual — stored in slot, not sent to exchange
         _log(
@@ -687,6 +720,9 @@ class HighSpeedExecutor:
         except Exception as e:
             _log(f"[Executor] place_tp_sl error {symbol}: {e}")
 
+        # Entry fee: 0.1% taker on market buy
+        entry_fee = self.cfg.capital * 0.001
+
         return SlotState(
             symbol       = symbol,
             buy_order_id = buy["order_id"],
@@ -695,7 +731,8 @@ class HighSpeedExecutor:
             entry_price  = buy["filled_price"],
             filled_qty   = buy["filled_qty"],
             tp1=tp1, tp2=tp2, tp3=tp3,
-            stop_loss=stop_loss,
+            stop_loss    = stop_loss,
+            entry_fee    = entry_fee,
         )
 
 
@@ -753,6 +790,10 @@ class TradeMonitor:
                             symbol,
                         )
                         _log(f"[Shadow SL] {symbol}: TP orders cancelled")
+                    except ccxt.NetworkError as e:
+                        _log(f"[Shadow SL] NetworkError cancel {symbol}: {e}")
+                    except ccxt.ExchangeError as e:
+                        _log(f"[Shadow SL] ExchangeError cancel {symbol}: {e}")
                     except Exception as e:
                         _log(f"[Shadow SL] cancel_all failed {symbol}: {e}")
 
@@ -812,46 +853,18 @@ class TradeMonitor:
         age_hrs = (now - state.opened_at) / 3600
 
         # Shadow SL: SL is virtual — only check TP1 presence on exchange
+        # Shadow SL architecture: SL absence on exchange is EXPECTED and nominal.
+        # Only audit TP1 presence. Timeout liquidation is fully disabled.
         tp_active = bool(state.tp1_order_id and state.tp1_order_id in open_order_ids)
-
-        # Shadow SL: SL absence is EXPECTED — only TP1 matters
         orphaned_no_exits = not tp_active
 
-        # Timeout logic — respects disable flag and profit/RSI shields
-        orphaned_timeout = False
-        if not self.cfg.disable_timeout_liquidation:
-            if age_hrs >= self.cfg.max_trade_hours and not state.extended:
-                # ── Condition A: Profit Shield — price above entry → extend ──
-                try:
-                    ticker     = await asyncio.get_running_loop().run_in_executor(
-                        None, self.executor.exchange.fetch_ticker, symbol
-                    )
-                    curr_price = float(ticker.get("last") or ticker.get("close") or 0)
-                    if curr_price > 0 and curr_price > state.entry_price:
-                        _log(
-                            f"[Timeout Shield A] {symbol}: curr={curr_price:.8g} > "
-                            f"entry={state.entry_price:.8g} — floating profit, extending indefinitely"
-                        )
-                        self.slots.update_state(symbol, extended=True)
-                    else:
-                        # ── Condition B: RSI Momentum Shield ──
-                        rsi_ok = await self._check_rsi_momentum(symbol)
-                        if rsi_ok:
-                            _log(f"[Timeout Shield B] {symbol}: RSI bounce detected — extending")
-                            self.slots.update_state(symbol, extended=True)
-                        else:
-                            orphaned_timeout = True
-                except Exception as e:
-                    _log(f"[Timeout Shield] {symbol}: price check failed: {e}")
-                    orphaned_timeout = True
-
-        if not orphaned_no_exits and not orphaned_timeout:
-            _log(f"[Reconcile] ✅ {symbol}: TP={'✅' if tp_active else '❌'} SL=برمجائي age={age_hrs:.1f}h")
+        if not orphaned_no_exits:
+            _log(f"[Reconcile] ✅ {symbol}: TP=✅ SL=برمجائي صامت age={age_hrs:.1f}h")
             return
 
         reason_parts = []
         if orphaned_no_exits: reason_parts.append("لا توجد أوامر TP/SL نشطة على المنصة")
-        if orphaned_timeout:  reason_parts.append(f"تجاوزت {self.cfg.max_trade_hours:.0f} ساعة")
+        # Timeout liquidation disabled — only TP absence triggers self-healing
         reason_ar = " | ".join(reason_parts)
 
         _log(f"🚨 [Self-Healing] {symbol}: {reason_ar}")
@@ -919,17 +932,26 @@ class TradeMonitor:
         except Exception:
             pass
 
-        entry = state.entry_price
+        entry      = state.entry_price
+        filled_qty = state.filled_qty
+        entry_fee  = state.entry_fee  # 0.1% taker paid at buy
+
         if exit_price > 0 and entry > 0:
-            pnl_usd = (exit_price - entry) * state.filled_qty
-            pnl_pct = ((exit_price - entry) / entry) * 100
+            exit_fee       = (exit_price * filled_qty) * 0.001  # taker fee on market sell
+            gross_pnl      = (exit_price - entry) * filled_qty
+            total_fees_usd = entry_fee + exit_fee
+            net_pnl_usd    = gross_pnl - total_fees_usd
+            net_pnl_pct    = (net_pnl_usd / (entry * filled_qty)) * 100 if entry > 0 else 0.0
+            sign_p = "+" if net_pnl_usd >= 0 else ""
+            sign_c = "+" if net_pnl_pct >= 0 else ""
+            emoji  = "✅" if net_pnl_usd >= 0 else "\U0001f534"
             pnl_line = (
-                f"✅ ربح: <b>+${pnl_usd:.3f} (+{pnl_pct:.2f}%)</b>"
-                if pnl_usd >= 0 else
-                f"\U0001f534 خسارة: <b>${pnl_usd:.3f} ({pnl_pct:.2f}%)</b>"
+                f"• <b>رسوم المنصة الإجمالية:</b> <code>${total_fees_usd:.4f}</code>\n"
+                f"• <b>النتيجة الصافية الحقيقية:</b> {emoji} "
+                f"<b>${sign_p}{net_pnl_usd:.3f} ({sign_c}{net_pnl_pct:.2f}%)</b>"
             )
         else:
-            pnl_line = "⚠️ PnL غير متاح"
+            pnl_line = "• ⚠️ PnL غير متاح — سعر الخروج غير مرئي"
 
         if liquidated:
             self.slots.release(symbol)
@@ -937,9 +959,9 @@ class TradeMonitor:
                 "\U0001f6a8 <b>Self-Healing: تصفية طارئة</b>\n\n"
                 f"• <b>العملة:</b> <code>{symbol}</code>\n"
                 f"• <b>السبب:</b> {reason_ar}\n"
-                f"• <b>سعر الدخول:</b> <code>${entry:.8g}</code>"
-                f" | <b>سعر الخروج:</b> <code>${exit_price:.8g}</code>\n"
-                f"• <b>النتيجة:</b> {pnl_line}\n\n"
+                f"• <b>سعر الدخول:</b> <code>{entry:.8g}</code>"
+                f" | <b>سعر الخروج:</b> <code>{exit_price:.8g}</code>\n"
+                f"{pnl_line}\n\n"
                 "<i>تم تسييل المراكز المتعثرة لفتح مقاعد صيد جديدة.</i>"
             )
         else:
@@ -1000,19 +1022,36 @@ class TradeMonitor:
         return False
 
     async def _notify_exit(self, state: SlotState, exit_type: str, exit_price: float):
-        entry   = state.entry_price
-        pnl_usd = (exit_price - entry) * state.filled_qty
-        pnl_pct = ((exit_price - entry) / entry) * 100
-        emoji   = "✅" if pnl_usd >= 0 else "🔴"
-        pnl_str = f"{'+' if pnl_usd >= 0 else ''}{pnl_usd:.3f} ({'+' if pnl_pct >= 0 else ''}{pnl_pct:.2f}%)"
-        label   = "🎯 TP1 وصل الهدف" if exit_type == "TP1" else "🛑 وقف الخسارة"
+        entry      = state.entry_price
+        filled_qty = state.filled_qty
+        entry_fee  = state.entry_fee  # 0.1% taker paid at buy
+
+        # Exit fee: 0% maker for TP limit, 0.1% taker for SL market sell
+        if exit_type == "TP1":
+            exit_fee = 0.0   # Maker order — zero fee on MEXC
+        else:
+            exit_fee = (exit_price * filled_qty) * 0.001  # Taker 0.1%
+
+        gross_pnl_usd  = (exit_price - entry) * filled_qty
+        total_fees_usd = entry_fee + exit_fee
+        net_pnl_usd    = gross_pnl_usd - total_fees_usd
+        net_pnl_pct    = (net_pnl_usd / (entry * filled_qty)) * 100 if entry > 0 else 0.0
+
+        emoji = "✅" if net_pnl_usd >= 0 else "🔴"
+        label = "🎯 TP1 وصل الهدف" if exit_type == "TP1" else "🛑 وقف الخسارة (Shadow SL)"
+
+        sign_pnl = "+" if net_pnl_usd >= 0 else ""
+        sign_pct = "+" if net_pnl_pct >= 0 else ""
 
         await self._notify(
             f"{label}\n\n"
             f"• <b>العملة:</b> <code>{state.symbol}</code>\n"
-            f"• <b>سعر الدخول:</b> <code>${entry:.8g}</code>"
-            f" | <b>سعر الخروج:</b> <code>${exit_price:.8g}</code>\n"
-            f"• <b>النتيجة:</b> {emoji} <b>${pnl_str}</b>"
+            f"• <b>سعر الدخول:</b> <code>{entry:.8g}</code>"
+            f" | <b>سعر الخروج:</b> <code>{exit_price:.8g}</code>\n"
+            f"• <b>الكمية:</b> <code>{filled_qty:.6f}</code>\n"
+            f"• <b>رسوم المنصة الإجمالية:</b> <code>${total_fees_usd:.4f}</code>\n"
+            f"• <b>النتيجة الصافية الحقيقية:</b> {emoji} "
+            f"<b>${sign_pnl}{net_pnl_usd:.3f} ({sign_pct}{net_pnl_pct:.2f}%)</b>"
         )
 
     async def _notify(self, text: str):
@@ -1142,7 +1181,11 @@ class ScalpingOrchestrator:
 
     def _fetch_indicators(self, symbol: str) -> Optional[dict]:
         try:
-            ohlcv = self.executor.exchange.fetch_ohlcv(symbol, timeframe="1d", limit=120)
+            try:
+                ohlcv = self.executor.exchange.fetch_ohlcv(symbol, timeframe="1d", limit=120)
+            except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+                _log(f"[Scan] OHLCV fetch failed {symbol}: {type(e).__name__}")
+                return None
             if not ohlcv or len(ohlcv) < 30:
                 return None
             df      = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"]).astype(float)
@@ -1155,6 +1198,10 @@ class ScalpingOrchestrator:
             try:
                 t       = self.executor.exchange.fetch_ticker(symbol)
                 vol_usd = float(t.get("quoteVolume") or 0)
+            except ccxt.NetworkError:
+                pass
+            except ccxt.ExchangeError:
+                pass
             except Exception:
                 pass
             return {"current": current, "rsi": rsi,
@@ -1257,7 +1304,7 @@ class ScalpingOrchestrator:
             _log(f"[L3] {symbol}: price=0 — abort")
             return
 
-        # ── Inline Balance Guard — check free USDT immediately before trade ──
+        # ── Inline Real-Time Balance Guard (anti-spam injection) ──
         try:
             bal_check = self.executor.exchange.fetch_balance({"type": "spot"})
             free_usdt = float(
@@ -1266,13 +1313,16 @@ class ScalpingOrchestrator:
             )
             if free_usdt < self.cfg.capital:
                 _log(
-                    f"[Local Balance Guard] Free USDT (${free_usdt:.2f}) drops below "
-                    f"trade capital size (${self.cfg.capital:.2f}). "
-                    f"Aborting further batch execution locally."
+                    f"[Local Balance Guard] Insufficient funds (${free_usdt:.2f} < "
+                    f"${self.cfg.capital:.2f}). Halting batch loop."
                 )
-                return  # silent — no Telegram
+                return  # silent — no Telegram notification
+        except ccxt.NetworkError as e:
+            _log(f"[Local Balance Guard] NetworkError: {e}")
+        except ccxt.ExchangeError as e:
+            _log(f"[Local Balance Guard] ExchangeError: {e}")
         except Exception as e:
-            _log(f"[Inline Balance Guard] fetch failed: {e}")
+            _log(f"[Local Balance Guard] fetch failed: {e}")
 
         # ── Layer 3: Execute ──
         state = await asyncio.get_running_loop().run_in_executor(
