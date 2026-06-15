@@ -959,8 +959,18 @@ class TradeMonitor:
         age_hrs = (now - state.opened_at) / 3600
 
         # Shadow SL: SL is virtual — only check TP1 presence on exchange
-        # Shadow SL architecture: SL absence on exchange is EXPECTED and nominal.
-        # Only audit TP1 presence. Timeout liquidation is fully disabled.
+        # Shadow SL: SL absence is EXPECTED.
+        # TP1 hit check: if tp1_filled=True, TP1 is intentionally gone from exchange
+        # — we are now in TP2/TP3 shadow monitoring phase, NOT orphaned.
+        if state.tp1_filled:
+            # TP1 already filled — position is in shadow TP2/TP3 phase
+            # _check_slot handles this — reconcile must not interfere
+            _log(
+                f"[Reconcile] ✅ {symbol}: TP1 مكتمل — "
+                f"في مرحلة TP2/TP3 برمجائية age={age_hrs:.1f}h"
+            )
+            return
+
         tp_active = bool(state.tp1_order_id and state.tp1_order_id in open_order_ids)
         orphaned_no_exits = not tp_active
 
