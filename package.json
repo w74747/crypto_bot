@@ -1,7 +1,0 @@
-{
-  "name": "trading-dashboard",
-  "version": "1.0.0",
-  "scripts": {
-    "start": "npx serve . -l $PORT"
-  }
-}
