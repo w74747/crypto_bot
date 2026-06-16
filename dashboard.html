@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#ffffff">
+<title>MEXC Trading Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#f8f9fb;--surface:#fff;--surface2:#f2f4f7;--surface3:#e8eaed;
+  --border:#e2e5ea;--border2:#cdd0d5;
+  --text:#111318;--text2:#4a5060;--text3:#8a909c;
+  --accent:#1a56db;--accent-light:#eff4ff;--accent-border:#c3d3f5;
+  --green:#0a7040;--green-bg:#ecfdf3;--green-border:#a7e3c2;
+  --red:#b91c1c;--red-bg:#fef2f2;--red-border:#fca5a5;
+  --amber:#92400e;--amber-bg:#fffbeb;--amber-border:#fcd34d;
+  --shadow:0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);
+  --shadow-md:0 4px 12px rgba(0,0,0,.08);
+  --radius:8px;--radius-lg:12px;--radius-xl:16px;
+  --font:'Inter',system-ui,sans-serif;
+  --mono:'JetBrains Mono',monospace;
+}
+
+body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;font-size:14px;line-height:1.5}
+
+/* ── AUTH SCREEN ── */
+#auth-screen{
+  position:fixed;inset:0;background:var(--bg);
+  display:flex;align-items:center;justify-content:center;z-index:1000;
+}
+.auth-card{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-xl);padding:48px 40px;
+  width:100%;max-width:400px;text-align:center;
+  box-shadow:var(--shadow-md);
+}
+.auth-logo{
+  width:52px;height:52px;background:var(--accent);border-radius:14px;
+  display:flex;align-items:center;justify-content:center;margin:0 auto 24px;
+}
+.auth-logo svg{width:28px;height:28px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;}
+.auth-title{font-size:22px;font-weight:600;color:var(--text);margin-bottom:6px}
+.auth-sub{font-size:13px;color:var(--text3);margin-bottom:32px;line-height:1.6}
+.otp-row{display:flex;gap:8px;justify-content:center;margin-bottom:8px}
+.otp-input{
+  width:44px;height:52px;text-align:center;font-family:var(--mono);
+  font-size:20px;font-weight:500;border:1.5px solid var(--border2);
+  border-radius:var(--radius);background:var(--surface);color:var(--text);
+  transition:border-color .15s;outline:none;
+}
+.otp-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(26,86,219,.12)}
+.auth-btn{
+  width:100%;padding:12px;background:var(--accent);color:#fff;
+  border:none;border-radius:var(--radius);font-size:14px;font-weight:500;
+  cursor:pointer;margin-top:20px;transition:background .15s;font-family:var(--font);
+}
+.auth-btn:hover{background:#1648c7}
+.auth-btn:disabled{background:var(--surface3);color:var(--text3);cursor:default}
+.auth-error{
+  font-size:12px;color:var(--red);margin-top:12px;min-height:18px;
+  display:flex;align-items:center;justify-content:center;gap:6px;
+}
+.timer-bar{height:3px;background:var(--surface3);border-radius:2px;margin-top:24px;overflow:hidden}
+.timer-fill{height:100%;background:var(--accent);transition:width 1s linear;border-radius:2px}
+.timer-label{font-size:11px;color:var(--text3);margin-top:6px}
+
+/* ── LAYOUT ── */
+#app{display:none;min-height:100vh}
+.topbar{
+  background:var(--surface);border-bottom:1px solid var(--border);
+  padding:0 24px;height:60px;display:flex;align-items:center;
+  justify-content:space-between;position:sticky;top:0;z-index:100;
+}
+.topbar-brand{display:flex;align-items:center;gap:10px}
+.brand-mark{
+  width:32px;height:32px;background:var(--accent);border-radius:8px;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+}
+.brand-mark svg{width:18px;height:18px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;}
+.brand-name{font-size:15px;font-weight:600;letter-spacing:-.2px}
+.brand-sub{font-size:11px;color:var(--text3);font-weight:400}
+.topbar-right{display:flex;align-items:center;gap:16px}
+.live-badge{
+  display:flex;align-items:center;gap:6px;padding:5px 10px;
+  background:var(--green-bg);border:1px solid var(--green-border);
+  border-radius:20px;font-size:12px;color:var(--green);font-weight:500;
+}
+.live-dot{width:7px;height:7px;background:#16a34a;border-radius:50%;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.logout-btn{
+  display:flex;align-items:center;gap:6px;padding:6px 12px;
+  background:none;border:1px solid var(--border2);border-radius:var(--radius);
+  font-size:12px;color:var(--text2);cursor:pointer;font-family:var(--font);
+  transition:all .15s;
+}
+.logout-btn:hover{background:var(--surface2);color:var(--text)}
+
+.main{padding:24px;max-width:1400px;margin:0 auto}
+
+/* ── KPI CARDS ── */
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
+.kpi-card{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-lg);padding:18px 20px;
+}
+.kpi-label{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;font-weight:500;margin-bottom:8px;display:flex;align-items:center;gap:6px}
+.kpi-label svg{width:14px;height:14px;flex-shrink:0;opacity:.6}
+.kpi-value{font-size:26px;font-weight:600;line-height:1.1;letter-spacing:-.5px}
+.kpi-sub{font-size:11px;color:var(--text3);margin-top:4px}
+.kpi-pos{color:var(--green)}
+.kpi-neg{color:var(--red)}
+.kpi-accent{color:var(--accent)}
+
+/* ── CHARTS ROW ── */
+.charts-row{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px}
+@media(max-width:768px){.charts-row{grid-template-columns:1fr}}
+.chart-card{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-lg);padding:20px;
+}
+.chart-title{font-size:13px;font-weight:500;color:var(--text);margin-bottom:16px}
+
+/* ── FILTERS ── */
+.filters-bar{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-lg);padding:16px 20px;margin-bottom:16px;
+  display:flex;flex-wrap:wrap;gap:12px;align-items:center;
+}
+.filter-group{display:flex;align-items:center;gap:8px}
+.filter-label{font-size:12px;color:var(--text3);font-weight:500;white-space:nowrap}
+.filter-select,.filter-input{
+  padding:7px 10px;border:1px solid var(--border2);border-radius:var(--radius);
+  font-size:13px;color:var(--text);background:var(--surface);
+  font-family:var(--font);outline:none;cursor:pointer;
+  transition:border-color .15s;
+}
+.filter-select:focus,.filter-input:focus{border-color:var(--accent)}
+.filter-input{width:130px}
+.filter-spacer{flex:1}
+.action-btn{
+  display:flex;align-items:center;gap:6px;padding:7px 14px;
+  border-radius:var(--radius);font-size:13px;font-weight:500;
+  cursor:pointer;font-family:var(--font);transition:all .15s;border:1px solid;
+}
+.btn-primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn-primary:hover{background:#1648c7;border-color:#1648c7}
+.btn-outline{background:var(--surface);color:var(--text2);border-color:var(--border2)}
+.btn-outline:hover{background:var(--surface2);color:var(--text)}
+.btn-icon{width:16px;height:16px;flex-shrink:0}
+
+/* ── TABLE ── */
+.table-card{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-lg);overflow:hidden;
+}
+.table-header{
+  padding:16px 20px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;
+}
+.table-title{font-size:14px;font-weight:500}
+.table-count{font-size:12px;color:var(--text3)}
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{width:100%;border-collapse:collapse}
+th{
+  padding:10px 16px;text-align:right;font-size:11px;color:var(--text3);
+  font-weight:500;text-transform:uppercase;letter-spacing:.5px;
+  border-bottom:1px solid var(--border);background:var(--surface2);
+  white-space:nowrap;
+}
+td{
+  padding:12px 16px;border-bottom:1px solid var(--border);
+  font-size:13px;color:var(--text);white-space:nowrap;
+}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--surface2)}
+.mono{font-family:var(--mono);font-size:12px}
+.badge{
+  display:inline-flex;align-items:center;gap:4px;padding:3px 8px;
+  border-radius:20px;font-size:11px;font-weight:500;border:1px solid;
+}
+.badge-green{background:var(--green-bg);color:var(--green);border-color:var(--green-border)}
+.badge-red{background:var(--red-bg);color:var(--red);border-color:var(--red-border)}
+.badge-amber{background:var(--amber-bg);color:var(--amber);border-color:var(--amber-border)}
+.badge-blue{background:var(--accent-light);color:var(--accent);border-color:var(--accent-border)}
+.badge-gray{background:var(--surface2);color:var(--text2);border-color:var(--border2)}
+.pnl-pos{color:var(--green);font-weight:500}
+.pnl-neg{color:var(--red);font-weight:500}
+
+/* ── TABS ── */
+.tabs{display:flex;gap:2px;padding:4px;background:var(--surface2);border-radius:var(--radius);margin-bottom:20px;width:fit-content}
+.tab{
+  padding:6px 16px;border-radius:6px;font-size:13px;font-weight:500;
+  cursor:pointer;color:var(--text3);transition:all .15s;border:none;background:none;font-family:var(--font);
+}
+.tab.active{background:var(--surface);color:var(--text);box-shadow:var(--shadow)}
+
+/* ── EMPTY ── */
+.empty-state{padding:64px 24px;text-align:center;color:var(--text3)}
+.empty-icon{width:40px;height:40px;margin:0 auto 12px;opacity:.3}
+.empty-text{font-size:14px}
+
+/* ── PAGINATION ── */
+.pagination{
+  display:flex;align-items:center;gap:8px;padding:12px 20px;
+  border-top:1px solid var(--border);justify-content:space-between;
+}
+.page-info{font-size:12px;color:var(--text3)}
+.page-btns{display:flex;gap:4px}
+.page-btn{
+  padding:5px 10px;border:1px solid var(--border2);border-radius:var(--radius);
+  background:var(--surface);font-size:12px;color:var(--text2);cursor:pointer;
+  font-family:var(--font);transition:all .15s;
+}
+.page-btn:hover{background:var(--surface2)}
+.page-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.page-btn:disabled{opacity:.4;cursor:default}
+
+/* ── SECTION TITLE ── */
+.section-title{font-size:13px;font-weight:500;color:var(--text2);margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.section-title::after{content:'';flex:1;height:1px;background:var(--border)}
+
+/* ── LOADING ── */
+.loading{display:flex;align-items:center;justify-content:center;padding:48px;gap:10px;color:var(--text3);font-size:13px}
+.spinner{width:20px;height:20px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── MOBILE ── */
+@media(max-width:640px){
+  .topbar{padding:0 16px}
+  .main{padding:16px}
+  .kpi-grid{grid-template-columns:repeat(2,1fr)}
+  .filters-bar{flex-direction:column;align-items:stretch}
+  .filter-group{justify-content:space-between}
+  .filter-select,.filter-input{flex:1}
+  .table-header{flex-direction:column;align-items:flex-start;gap:8px}
+  th,td{padding:10px 12px}
+}
+@media(max-width:360px){.kpi-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<!-- AUTH -->
+<div id="auth-screen">
+  <div class="auth-card">
+    <div class="auth-logo">
+      <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+    </div>
+    <div class="auth-title">لوحة تحكم التداول</div>
+    <div class="auth-sub">أدخل الرمز السداسي من تطبيق<br>Google Authenticator للمتابعة</div>
+    <div class="otp-row" id="otp-row">
+      <input class="otp-input" maxlength="1" type="text" inputmode="numeric" pattern="[0-9]">
+      <input class="otp-input" maxlength="1" type="text" inputmode="numeric" pattern="[0-9]">
+      <input class="otp-input" maxlength="1" type="text" inputmode="numeric" pattern="[0-9]">
+      <input class="otp-input" maxlength="1" type="text" inputmode="numeric" pattern="[0-9]">
+      <input class="otp-input" maxlength="1" type="text" inputmode="numeric" pattern="[0-9]">
+      <input class="otp-input" maxlength="1" type="text" inputmode="numeric" pattern="[0-9]">
+    </div>
+    <div class="auth-error" id="auth-error"></div>
+    <button class="auth-btn" id="auth-btn" disabled onclick="verifyOTP()">تحقق من الرمز</button>
+    <div class="timer-bar"><div class="timer-fill" id="timer-fill"></div></div>
+    <div class="timer-label" id="timer-label">الرمز يتجدد كل 30 ثانية</div>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="app">
+  <header class="topbar">
+    <div class="topbar-brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      </div>
+      <div>
+        <div class="brand-name">Trading Dashboard</div>
+        <div class="brand-sub">MEXC Spot · Scalping Engine</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="live-badge"><div class="live-dot"></div>مباشر</div>
+      <button class="logout-btn" onclick="logout()">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        خروج
+      </button>
+    </div>
+  </header>
+
+  <main class="main">
+    <div id="loading-state" class="loading">
+      <div class="spinner"></div> جاري تحميل البيانات...
+    </div>
+    <div id="content" style="display:none">
+
+      <!-- KPIs -->
+      <div class="kpi-grid" id="kpi-grid"></div>
+
+      <!-- CHARTS -->
+      <div class="charts-row">
+        <div class="chart-card">
+          <div class="chart-title">أداء الصفقات الشهرية</div>
+          <div style="position:relative;height:220px"><canvas id="chart-monthly" role="img" aria-label="أداء الصفقات الشهرية">بيانات الأداء الشهري</canvas></div>
+        </div>
+        <div class="chart-card">
+          <div class="chart-title">توزيع نتائج الصفقات</div>
+          <div style="display:flex;align-items:center;gap:24px">
+            <div style="position:relative;height:180px;flex:1"><canvas id="chart-donut" role="img" aria-label="توزيع نتائج الصفقات">توزيع النتائج</canvas></div>
+            <div id="donut-legend" style="font-size:12px;display:flex;flex-direction:column;gap:10px;flex-shrink:0"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TABS + FILTERS -->
+      <div class="tabs" id="tabs">
+        <button class="tab active" onclick="setTab('all',this)">كل الصفقات</button>
+        <button class="tab" onclick="setTab('open',this)">مفتوحة</button>
+        <button class="tab" onclick="setTab('closed',this)">مغلقة</button>
+        <button class="tab" onclick="setTab('win',this)">رابحة</button>
+        <button class="tab" onclick="setTab('loss',this)">خاسرة</button>
+      </div>
+
+      <div class="filters-bar">
+        <div class="filter-group">
+          <span class="filter-label">العملة</span>
+          <select class="filter-select" id="f-symbol" onchange="applyFilters()">
+            <option value="">الكل</option>
+          </select>
+        </div>
+        <div class="filter-group">
+          <span class="filter-label">من</span>
+          <input type="date" class="filter-input" id="f-from" onchange="applyFilters()">
+        </div>
+        <div class="filter-group">
+          <span class="filter-label">إلى</span>
+          <input type="date" class="filter-input" id="f-to" onchange="applyFilters()">
+        </div>
+        <div class="filter-group">
+          <span class="filter-label">النتيجة</span>
+          <select class="filter-select" id="f-exit" onchange="applyFilters()">
+            <option value="">الكل</option>
+            <option value="TP1">TP1</option>
+            <option value="TP2">TP2</option>
+            <option value="TP3">TP3</option>
+            <option value="SL">SL</option>
+            <option value="Self-Healing">Self-Healing</option>
+          </select>
+        </div>
+        <div class="filter-spacer"></div>
+        <button class="action-btn btn-outline" onclick="resetFilters()">
+          <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.51"/></svg>
+          إعادة تعيين
+        </button>
+        <button class="action-btn btn-primary" onclick="exportExcel()">
+          <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          تصدير Excel
+        </button>
+      </div>
+
+      <!-- TABLE -->
+      <div class="table-card">
+        <div class="table-header">
+          <div class="table-title">سجل الصفقات</div>
+          <div class="table-count" id="table-count"></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>العملة</th>
+                <th>تاريخ الدخول</th>
+                <th>سعر الدخول</th>
+                <th>TP1 / TP2 / TP3</th>
+                <th>سعر الخروج</th>
+                <th>النتيجة</th>
+                <th>الربح الصافي</th>
+                <th>الرسوم</th>
+                <th>المدة</th>
+                <th>Committee</th>
+                <th>الحالة</th>
+              </tr>
+            </thead>
+            <tbody id="table-body"></tbody>
+          </table>
+        </div>
+        <div class="pagination" id="pagination"></div>
+      </div>
+
+    </div><!-- /content -->
+  </main>
+</div>
+
+<script>
+// ── CONFIG ──────────────────────────────────────────
+// استبدل هذه القيم بقيمك الفعلية
+const SUPABASE_URL  = 'YOUR_SUPABASE_URL';
+const SUPABASE_KEY  = 'YOUR_SUPABASE_ANON_KEY';
+const TOTP_SECRET   = 'YOUR_TOTP_SECRET_BASE32'; // نفس السر الذي مسحته في Google Authenticator
+const PAGE_SIZE     = 20;
+
+// ── TOTP ENGINE ─────────────────────────────────────
+function b32decode(s){
+  const a='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  s=s.toUpperCase().replace(/=+$/,'');
+  let bits=0,val=0,out=[];
+  for(const c of s){const i=a.indexOf(c);if(i<0)continue;val=(val<<5)|i;bits+=5;if(bits>=8){out.push((val>>>(bits-8))&255);bits-=8;}}
+  return new Uint8Array(out);
+}
+async function totp(secret){
+  const key=b32decode(secret);
+  const T=Math.floor(Date.now()/1000/30);
+  const tb=new Uint8Array(8);
+  for(let i=7;i>=0;i--){tb[i]=T&255;T>>=8}
+  const k=await crypto.subtle.importKey('raw',key,{name:'HMAC',hash:'SHA-1'},false,['sign']);
+  const sig=new Uint8Array(await crypto.subtle.sign('HMAC',k,tb));
+  const o=sig[19]&0xf;
+  const code=((sig[o]&0x7f)<<24|(sig[o+1]&0xff)<<16|(sig[o+2]&0xff)<<8|(sig[o+3]&0xff))%1000000;
+  return String(code).padStart(6,'0');
+}
+
+// ── OTP UI ──────────────────────────────────────────
+const inputs=[...document.querySelectorAll('.otp-input')];
+inputs.forEach((inp,i)=>{
+  inp.addEventListener('input',e=>{
+    inp.value=inp.value.replace(/\D/g,'');
+    if(inp.value&&i<5)inputs[i+1].focus();
+    updateBtn();
+  });
+  inp.addEventListener('keydown',e=>{
+    if(e.key==='Backspace'&&!inp.value&&i>0)inputs[i-1].focus();
+    if(e.key==='Enter')verifyOTP();
+  });
+  inp.addEventListener('paste',e=>{
+    e.preventDefault();
+    const p=(e.clipboardData||window.clipboardData).getData('text').replace(/\D/g,'').slice(0,6);
+    [...p].forEach((c,j)=>{if(inputs[j])inputs[j].value=c});
+    updateBtn();
+    inputs[Math.min(p.length,5)].focus();
+  });
+});
+inputs[0].focus();
+
+function updateBtn(){
+  const v=inputs.map(i=>i.value).join('');
+  document.getElementById('auth-btn').disabled=v.length<6;
+}
+
+// timer
+function updateTimer(){
+  const s=30-Math.floor(Date.now()/1000)%30;
+  const pct=(s/30)*100;
+  document.getElementById('timer-fill').style.width=pct+'%';
+  document.getElementById('timer-label').textContent=`الرمز يتجدد خلال ${s} ثانية`;
+  if(s===30)inputs.forEach(i=>i.value=''),updateBtn();
+}
+setInterval(updateTimer,1000);updateTimer();
+
+async function verifyOTP(){
+  const entered=inputs.map(i=>i.value).join('');
+  if(entered.length<6)return;
+  document.getElementById('auth-error').textContent='';
+  const expected=await totp(TOTP_SECRET);
+  if(entered===expected){
+    document.getElementById('auth-screen').style.display='none';
+    document.getElementById('app').style.display='block';
+    initApp();
+  } else {
+    document.getElementById('auth-error').innerHTML=
+      `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>رمز غير صحيح، حاول مرة أخرى`;
+    inputs.forEach(i=>i.value='');inputs[0].focus();updateBtn();
+  }
+}
+
+function logout(){
+  document.getElementById('app').style.display='none';
+  document.getElementById('auth-screen').style.display='flex';
+  inputs.forEach(i=>i.value='');updateBtn();
+  document.getElementById('auth-error').textContent='';
+}
+
+// ── DATA ────────────────────────────────────────────
+let allTrades=[];
+let filtered=[];
+let currentTab='all';
+let currentPage=1;
+let chartMonthly=null,chartDonut=null;
+
+async function fetchTrades(){
+  const res=await fetch(`${SUPABASE_URL}/rest/v1/trades?select=*&order=opened_at.desc&limit=1000`,{
+    headers:{'apikey':SUPABASE_KEY,'Authorization':`Bearer ${SUPABASE_KEY}`}
+  });
+  if(!res.ok)throw new Error('فشل تحميل البيانات: '+res.status);
+  return res.json();
+}
+
+async function initApp(){
+  try{
+    allTrades=await fetchTrades();
+    populateSymbolFilter();
+    applyFilters();
+    renderCharts();
+    document.getElementById('loading-state').style.display='none';
+    document.getElementById('content').style.display='block';
+  }catch(e){
+    document.getElementById('loading-state').innerHTML=
+      `<div style="color:var(--red);text-align:center">${e.message}<br><button class="action-btn btn-outline" style="margin-top:12px" onclick="initApp()">إعادة المحاولة</button></div>`;
+  }
+}
+
+function populateSymbolFilter(){
+  const syms=[...new Set(allTrades.map(t=>t.symbol))].sort();
+  const sel=document.getElementById('f-symbol');
+  sel.innerHTML='<option value="">الكل</option>';
+  syms.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;sel.appendChild(o)});
+}
+
+function setTab(tab,el){
+  currentTab=tab;currentPage=1;
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  applyFilters();
+}
+
+function applyFilters(){
+  currentPage=1;
+  const sym=document.getElementById('f-symbol').value;
+  const from=document.getElementById('f-from').value;
+  const to=document.getElementById('f-to').value;
+  const exit=document.getElementById('f-exit').value;
+
+  filtered=allTrades.filter(t=>{
+    if(sym&&t.symbol!==sym)return false;
+    if(from&&t.opened_at<from)return false;
+    if(to&&t.opened_at>to+'T23:59:59')return false;
+    if(exit&&t.exit_type!==exit)return false;
+    if(currentTab==='open'&&t.closed_at)return false;
+    if(currentTab==='closed'&&!t.closed_at)return false;
+    if(currentTab==='win'&&(t.net_pnl_usd==null||t.net_pnl_usd<=0))return false;
+    if(currentTab==='loss'&&(t.net_pnl_usd==null||t.net_pnl_usd>=0))return false;
+    return true;
+  });
+  renderKPIs();
+  renderTable();
+}
+
+function resetFilters(){
+  document.getElementById('f-symbol').value='';
+  document.getElementById('f-from').value='';
+  document.getElementById('f-to').value='';
+  document.getElementById('f-exit').value='';
+  currentTab='all';
+  document.querySelectorAll('.tab').forEach((t,i)=>{t.classList.toggle('active',i===0)});
+  applyFilters();
+}
+
+// ── KPIs ────────────────────────────────────────────
+function renderKPIs(){
+  const closed=filtered.filter(t=>t.closed_at);
+  const open=filtered.filter(t=>!t.closed_at);
+  const wins=closed.filter(t=>t.net_pnl_usd>0);
+  const losses=closed.filter(t=>t.net_pnl_usd<0);
+  const totalPnl=closed.reduce((s,t)=>s+(t.net_pnl_usd||0),0);
+  const winRate=closed.length?((wins.length/closed.length)*100):0;
+  const avgPnl=closed.length?(totalPnl/closed.length):0;
+
+  const kpis=[
+    {label:'إجمالي الصفقات',icon:'chart-bar',value:filtered.length,sub:`${closed.length} مغلقة · ${open.length} مفتوحة`,cls:''},
+    {label:'الأرباح الصافية',icon:'trending-up',value:'$'+totalPnl.toFixed(2),sub:`متوسط $${avgPnl.toFixed(2)} للصفقة`,cls:totalPnl>=0?'kpi-pos':'kpi-neg'},
+    {label:'نسبة النجاح',icon:'check-circle',value:winRate.toFixed(1)+'%',sub:`${wins.length} رابحة · ${losses.length} خاسرة`,cls:winRate>=60?'kpi-pos':winRate>=40?'kpi-accent':'kpi-neg'},
+    {label:'رابحة / خاسرة',icon:'activity',value:`${wins.length} / ${losses.length}`,sub:'صفقات مغلقة',cls:''},
+    {label:'الصفقات المفتوحة',icon:'clock',value:open.length,sub:'قيد التنفيذ',cls:'kpi-accent'},
+    {label:'إجمالي الرسوم',icon:'credit-card',value:'$'+(closed.reduce((s,t)=>s+(t.total_fees||0),0)).toFixed(4),sub:'رسوم MEXC',cls:''},
+  ];
+
+  const icons={
+    'chart-bar':'<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
+    'trending-up':'<polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/>',
+    'check-circle':'<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>',
+    'activity':'<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
+    'clock':'<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+    'credit-card':'<rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/>',
+  };
+
+  document.getElementById('kpi-grid').innerHTML=kpis.map(k=>`
+    <div class="kpi-card">
+      <div class="kpi-label">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${icons[k.icon]||''}</svg>
+        ${k.label}
+      </div>
+      <div class="kpi-value ${k.cls}">${k.value}</div>
+      <div class="kpi-sub">${k.sub}</div>
+    </div>
+  `).join('');
+}
+
+// ── TABLE ────────────────────────────────────────────
+function formatDuration(sec){
+  if(!sec)return '—';
+  const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60;
+  if(h>0)return `${h}h ${m}m`;
+  if(m>0)return `${m}m ${s}s`;
+  return `${s}s`;
+}
+function formatDate(d){
+  if(!d)return '—';
+  const dt=new Date(d);
+  return dt.toLocaleDateString('ar-SA',{month:'short',day:'numeric'})+' '+dt.toLocaleTimeString('ar-SA',{hour:'2-digit',minute:'2-digit'});
+}
+function exitBadge(t){
+  if(!t.exit_type)return '<span class="badge badge-blue">مفتوح</span>';
+  const map={TP1:'badge-green',TP2:'badge-green',TP3:'badge-green',SL:'badge-red','Self-Healing':'badge-amber'};
+  return `<span class="badge ${map[t.exit_type]||'badge-gray'}">${t.exit_type}</span>`;
+}
+
+function renderTable(){
+  const start=(currentPage-1)*PAGE_SIZE;
+  const page=filtered.slice(start,start+PAGE_SIZE);
+  document.getElementById('table-count').textContent=`${filtered.length} نتيجة`;
+
+  const tbody=document.getElementById('table-body');
+  if(!filtered.length){
+    tbody.innerHTML=`<tr><td colspan="11"><div class="empty-state"><svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg><div class="empty-text">لا توجد صفقات تطابق الفلتر</div></div></td></tr>`;
+    renderPagination();return;
+  }
+
+  tbody.innerHTML=page.map(t=>{
+    const pnl=t.net_pnl_usd;
+    const pnlStr=pnl!=null?(pnl>=0?`<span class="pnl-pos">+$${pnl.toFixed(3)}</span>`:`<span class="pnl-neg">-$${Math.abs(pnl).toFixed(3)}</span>`):'—';
+    const sym=t.symbol.replace('/USDT','');
+    return `<tr>
+      <td><span style="font-weight:500">${sym}</span><span style="color:var(--text3);font-size:11px">/USDT</span></td>
+      <td style="color:var(--text2);font-size:12px">${formatDate(t.opened_at)}</td>
+      <td class="mono">${t.entry_price?Number(t.entry_price).toPrecision(5):'—'}</td>
+      <td class="mono" style="font-size:11px;color:var(--text3)">${t.tp1?Number(t.tp1).toPrecision(4):'—'} / ${t.tp2?Number(t.tp2).toPrecision(4):'—'} / ${t.tp3?Number(t.tp3).toPrecision(4):'—'}</td>
+      <td class="mono">${t.exit_price?Number(t.exit_price).toPrecision(5):'—'}</td>
+      <td>${exitBadge(t)}</td>
+      <td>${pnlStr}</td>
+      <td style="color:var(--text3)">${t.total_fees?'$'+Number(t.total_fees).toFixed(4):'—'}</td>
+      <td style="color:var(--text2)">${formatDuration(t.duration_sec)}</td>
+      <td style="font-size:11px;color:var(--text3)">${t.ds_vote||'—'} / ${t.llama_vote||'—'}</td>
+      <td>${t.closed_at?'<span class="badge badge-gray">مغلقة</span>':'<span class="badge badge-blue">مفتوحة</span>'}</td>
+    </tr>`;
+  }).join('');
+  renderPagination();
+}
+
+function renderPagination(){
+  const total=Math.ceil(filtered.length/PAGE_SIZE);
+  const pg=document.getElementById('pagination');
+  if(total<=1){pg.innerHTML='';return}
+  let btns='';
+  for(let i=1;i<=total;i++){
+    if(i===1||i===total||Math.abs(i-currentPage)<=2)
+      btns+=`<button class="page-btn${i===currentPage?' active':''}" onclick="goPage(${i})">${i}</button>`;
+    else if(Math.abs(i-currentPage)===3)btns+=`<span style="padding:0 4px;color:var(--text3)">…</span>`;
+  }
+  pg.innerHTML=`
+    <div class="page-info">${(currentPage-1)*PAGE_SIZE+1}–${Math.min(currentPage*PAGE_SIZE,filtered.length)} من ${filtered.length}</div>
+    <div class="page-btns">
+      <button class="page-btn" onclick="goPage(${currentPage-1})" ${currentPage===1?'disabled':''}>‹</button>
+      ${btns}
+      <button class="page-btn" onclick="goPage(${currentPage+1})" ${currentPage===total?'disabled':''}>›</button>
+    </div>`;
+}
+
+function goPage(p){
+  const total=Math.ceil(filtered.length/PAGE_SIZE);
+  if(p<1||p>total)return;
+  currentPage=p;renderTable();
+  document.querySelector('.table-card').scrollIntoView({behavior:'smooth',block:'start'});
+}
+
+// ── CHARTS ───────────────────────────────────────────
+function renderCharts(){
+  // Monthly PnL
+  const byMonth={};
+  allTrades.filter(t=>t.closed_at&&t.net_pnl_usd!=null).forEach(t=>{
+    const m=t.opened_at.slice(0,7);
+    byMonth[m]=(byMonth[m]||0)+t.net_pnl_usd;
+  });
+  const months=Object.keys(byMonth).sort().slice(-6);
+  const vals=months.map(m=>+byMonth[m].toFixed(2));
+
+  if(chartMonthly)chartMonthly.destroy();
+  chartMonthly=new Chart(document.getElementById('chart-monthly'),{
+    type:'bar',
+    data:{
+      labels:months.map(m=>{const[y,mo]=m.split('-');return new Date(y,mo-1).toLocaleDateString('ar',{month:'short',year:'2-digit'})}),
+      datasets:[{
+        data:vals,
+        backgroundColor:vals.map(v=>v>=0?'#dcfce7':'#fee2e2'),
+        borderColor:vals.map(v=>v>=0?'#16a34a':'#dc2626'),
+        borderWidth:1.5,borderRadius:6,
+      }]
+    },
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>'$'+ctx.raw.toFixed(2)}}},
+      scales:{
+        x:{grid:{display:false},ticks:{font:{size:11},color:'#8a909c'}},
+        y:{grid:{color:'rgba(0,0,0,.05)'},ticks:{font:{size:11},color:'#8a909c',callback:v=>'$'+v}}
+      }
+    }
+  });
+
+  // Donut
+  const closed=allTrades.filter(t=>t.closed_at&&t.exit_type);
+  const counts={TP1:0,TP2:0,TP3:0,SL:0,'Self-Healing':0};
+  closed.forEach(t=>{if(counts[t.exit_type]!==undefined)counts[t.exit_type]++});
+  const labels=Object.keys(counts).filter(k=>counts[k]>0);
+  const data=labels.map(k=>counts[k]);
+  const colors=['#16a34a','#2563eb','#7c3aed','#dc2626','#d97706'];
+
+  if(chartDonut)chartDonut.destroy();
+  chartDonut=new Chart(document.getElementById('chart-donut'),{
+    type:'doughnut',
+    data:{labels,datasets:[{data,backgroundColor:colors.slice(0,labels.length),borderWidth:0}]},
+    options:{
+      responsive:true,maintainAspectRatio:false,cutout:'68%',
+      plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`${ctx.label}: ${ctx.raw} (${((ctx.raw/data.reduce((a,b)=>a+b,0))*100).toFixed(0)}%)`}}}
+    }
+  });
+
+  const total=data.reduce((a,b)=>a+b,0);
+  document.getElementById('donut-legend').innerHTML=labels.map((l,i)=>`
+    <div style="display:flex;align-items:center;gap:8px">
+      <span style="width:10px;height:10px;border-radius:2px;background:${colors[i]};flex-shrink:0"></span>
+      <span style="color:var(--text2)">${l}</span>
+      <span style="color:var(--text3);margin-right:auto">${((data[i]/total)*100).toFixed(0)}%</span>
+    </div>
+  `).join('');
+}
+
+// ── EXCEL EXPORT ─────────────────────────────────────
+function exportExcel(){
+  const rows=filtered.map(t=>({
+    'العملة':t.symbol,
+    'تاريخ الدخول':t.opened_at?new Date(t.opened_at).toLocaleString('ar'):'',
+    'تاريخ الإغلاق':t.closed_at?new Date(t.closed_at).toLocaleString('ar'):'مفتوحة',
+    'رأس المال':t.capital,
+    'الكمية':t.filled_qty,
+    'سعر الدخول':t.entry_price,
+    'TP1':t.tp1,'TP2':t.tp2,'TP3':t.tp3,
+    'وقف الخسارة':t.stop_loss,
+    'سعر الخروج':t.exit_price,
+    'نوع الخروج':t.exit_type||'مفتوحة',
+    'الربح الصافي $':t.net_pnl_usd,
+    'الربح %':t.net_pnl_pct,
+    'الرسوم $':t.total_fees,
+    'المدة (ثانية)':t.duration_sec,
+    'DeepSeek':t.ds_vote,'Llama':t.llama_vote,
+    'RSS Sentiment':t.rss_sentiment,
+    'Galaxy Score':t.galaxy_score,
+    'Committee':t.committee_summary,
+    'ملاحظات':t.notes,
+  }));
+  const ws=XLSX.utils.json_to_sheet(rows);
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,'Trades',ws);
+  const d=new Date().toISOString().slice(0,10);
+  XLSX.writeFile(wb,`mexc_trades_${d}.xlsx`);
+}
+</script>
+</body>
+</html>
