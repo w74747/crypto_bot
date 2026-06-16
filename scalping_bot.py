@@ -487,10 +487,13 @@ class ConsensusCommittee:
 # ─────────────────────────────────────────────
 # 7. HIGH SPEED EXECUTOR
 # ─────────────────────────────────────────────
-# Inverted Pyramid Split: 30% TP1 exchange | 20% TP2 shadow | 20% TP3 shadow | 30% SL shadow
-TP1_QTY_PCT = 0.30
-TP2_QTY_PCT = 0.20
-TP3_QTY_PCT = 0.20
+# Scaled Exit Split:
+# TP1 = 20% exchange limit (partial profit lock)
+# TP2 = 40% shadow (50% of remaining 80%)
+# TP3 = 40% shadow (remaining 100% of what's left)
+TP1_QTY_PCT = 0.20
+TP2_QTY_PCT = 0.40
+TP3_QTY_PCT = 0.40
 
 
 class HighSpeedExecutor:
@@ -592,10 +595,10 @@ class HighSpeedExecutor:
         """
         ids: dict = {}
 
-        # Hybrid split: only 30% goes to exchange as TP1 limit
-        qty_tp1 = self._apply_step_size(symbol, filled_qty * 0.30)
-        qty_tp2 = self._apply_step_size(symbol, filled_qty * 0.20)
-        qty_tp3 = self._apply_step_size(symbol, filled_qty * 0.20)
+        # Scaled exit: 20% TP1 on exchange, 40% TP2 shadow, 40% TP3 shadow (= 100% total)
+        qty_tp1 = self._apply_step_size(symbol, filled_qty * 0.20)
+        qty_tp2 = self._apply_step_size(symbol, filled_qty * 0.40)
+        qty_tp3 = self._apply_step_size(symbol, filled_qty * 0.40)
         ids["qty_tp1"] = qty_tp1
         ids["qty_tp2"] = qty_tp2
         ids["qty_tp3"] = qty_tp3
@@ -910,7 +913,18 @@ class TradeMonitor:
             _log(f"[Shadow TP3] 🎯 {symbol}: curr={curr_price:.8g} ≥ TP3={state.tp3:.8g}")
             duration = _format_duration(state.entry_time)
 
-            tp3_qty = self.executor._apply_step_size(symbol, state.qty_tp3)
+            # TP3: جلب الرصيد الحر الفعلي لضمان بيع كل شيء
+            try:
+                base_asset = symbol.split("/")[0]
+                bal_check  = self.executor.exchange.fetch_balance({"type": "spot"})
+                free_qty   = float(
+                    bal_check.get(base_asset, {}).get("free", 0) or
+                    bal_check.get("free", {}).get(base_asset, 0)
+                )
+                tp3_qty = self.executor._apply_step_size(symbol, free_qty if free_qty > 0 else state.qty_tp3)
+            except Exception:
+                tp3_qty = self.executor._apply_step_size(symbol, state.qty_tp3)
+
             try:
                 tp3_precise_price = float(
                     self.executor.exchange.price_to_precision(symbol, state.tp3)
@@ -923,8 +937,8 @@ class TradeMonitor:
                 )
                 _log(f"[Shadow TP3] ✅ {symbol}: {tp3_qty} @ {tp3_precise_price:.8g} ID:{o['id']} ⏳{duration}")
                 self.slots.update_state(symbol, tp3_filled=True)
-                await self._notify_exit(state, "TP3", curr_price, state.qty_tp3)
-                # All targets hit — release slot
+                await self._notify_exit(state, "TP3", curr_price, tp3_qty)
+                # All targets complete — release slot
                 self.slots.release(symbol)
             except Exception as e:
                 _log(f"[Shadow TP3] sell failed {symbol}: {e}")
@@ -1179,21 +1193,23 @@ class TradeMonitor:
         tp3_pct = (state.tp3 / entry - 1) * 100 if entry > 0 else 0
         sl_pct  = (1 - state.stop_loss / entry) * 100 if entry > 0 else 0
 
+        # تحديد نسبة الكمية المباعة
+        qty_pct_map = {"TP1": "20%", "TP2": "40%", "TP3": "الكل المتبقي", "SL": "الكل المتبقي"}
+        qty_pct_str = qty_pct_map.get(exit_type, "—")
+
         await self._notify(
-            f"{label}\n\n"
-            f"• <b>العملة:</b> <code>{state.symbol}</code>\n"
-            f"• <b>سعر الدخول:</b> <code>{entry:.8g}</code>"
-            f" | <b>سعر الخروج:</b> <code>{exit_price:.8g}</code>\n"
-            f"• <b>الكمية المُنفَّذة:</b> <code>{exit_qty:.6f}</code>\n\n"
-            f"• <b>رأس المال المخصص للشراء:</b> <code>${self.cfg.capital:.2f}</code>\n"
-            f"• هدف المنصة TP1: <code>+{tp1_pct:.1f}%</code> (معلق رسمياً — 30% من الكمية)\n"
-            f"• هدف برمجائي TP2: <code>+{tp2_pct:.1f}%</code> (فيبوناتشي ديناميكي — 20%)\n"
-            f"• هدف برمجائي TP3: <code>+{tp3_pct:.1f}%</code> (فيبوناتشي ديناميكي — 20%)\n"
-            f"• SL برمجائي: <code>-{sl_pct:.1f}%</code> (30% متبقي)\n\n"
-            f"• <b>الوقت المستغرق للهدف:</b> ⏳ <code>{duration}</code>\n"
-            f"• <b>رسوم المنصة الإجمالية:</b> <code>${total_fees_usd:.4f}</code>\n"
-            f"• <b>النتيجة الصافية الحقيقية:</b> {emoji} "
-            f"<b>${sign_pnl}{net_pnl_usd:.3f} ({sign_pct}{net_pnl_pct:.2f}%)</b>"
+            f"{label}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📌 <b>العملة:</b> <code>{state.symbol}</code>\n"
+            f"🔢 <b>الكمية المباعة:</b> <code>{exit_qty:.4f}</code> ({qty_pct_str})\n"
+            f"📈 <b>سعر الدخول:</b> <code>{entry:.8g}</code>\n"
+            f"📉 <b>سعر الخروج:</b> <code>{exit_price:.8g}</code>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏳ <b>المدة:</b> <code>{duration}</code>\n"
+            f"💸 <b>رسوم المنصة:</b> <code>${total_fees_usd:.4f}</code>\n"
+            f"📊 <b>الربح الصافي:</b> {emoji} <b>${sign_pnl}{net_pnl_usd:.3f} ({sign_pct}{net_pnl_pct:.2f}%)</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"خطة الخروج: TP1=+{tp1_pct:.1f}% | TP2=+{tp2_pct:.1f}% | TP3=+{tp3_pct:.1f}% | SL=-{sl_pct:.1f}%"
         )
 
     async def _notify(self, text: str):
@@ -1290,10 +1306,10 @@ class ScalpingOrchestrator:
                 if approx_entry <= 0 or filled_qty <= 0:
                     continue
 
-                # إعادة بناء الـ qty split (30/20/20)
-                qty_tp1 = round(filled_qty * 0.30, 6)
-                qty_tp2 = round(filled_qty * 0.20, 6)
-                qty_tp3 = round(filled_qty * 0.20, 6)
+                # إعادة بناء الـ qty split (20/40/40)
+                qty_tp1 = round(filled_qty * 0.20, 6)
+                qty_tp2 = round(filled_qty * 0.40, 6)
+                qty_tp3 = round(filled_qty * 0.40, 6)
 
                 state = SlotState(
                     symbol       = symbol,
@@ -1526,25 +1542,22 @@ class ScalpingOrchestrator:
         sl_pct  = (1 - state.stop_loss / state.entry_price) * 100
 
         await self._send_telegram(
-            "🚀 <b>تم التنفيذ</b>\n\n"
-            f"• <b>العملة:</b> <code>{symbol}</code>\n"
-            f"• <b>سعر الدخول:</b> <code>{state.entry_price:.8g}</code>\n"
-            f"• <b>الكمية الكلية:</b> <code>{state.filled_qty:.6f}</code>\n"
-            f"• <b>رأس المال المخصص للشراء:</b> <code>${self.cfg.capital:.2f}</code>\n\n"
-            f"<b>هيكل الأهداف الهجين</b>\n"
-            f"• هدف المنصة TP1: <code>{state.tp1:.8g}</code> (+{tp1_pct:.1f}%)"
-            f"  — 30% ({state.qty_tp1:.4f}) ✅ معلق رسمياً\n"
-            f"• هدف برمجائي TP2: <code>{state.tp2:.8g}</code> (+{tp2_pct:.1f}%)"
-            f"  — 20% ({state.qty_tp2:.4f}) (فيبوناتشي ديناميكي)\n"
-            f"• هدف برمجائي TP3: <code>{state.tp3:.8g}</code> (+{tp3_pct:.1f}%)"
-            f"  — 20% ({state.qty_tp3:.4f}) (فيبوناتشي ديناميكي)\n"
-            f"• SL برمجائي: <code>{state.stop_loss:.8g}</code> (-{sl_pct:.1f}%) (30% متبقي)\n\n"
-            f"• <b>الرصيد الافتتاحي:</b> <code>${initial_balance:.2f}</code>\n"
-            f"• <b>الرصيد الحالي:</b>    <code>${current_balance:.2f}</code>\n\n"
-            f"• <b>Committee:</b> DeepSeek={result['ds_vote']} Llama={result['llama_vote']}\n"
-            f"• <b>RSS Macro:</b> {rss_sentiment}\n"
-            f"• <b>Galaxy Score:</b> {lunar_data.get('galaxy_score', 0):.0f}\n"
-            f"⏱️ {result['elapsed']}s"
+            "🚀 <b>صفقة جديدة — تم الدخول</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📌 <b>العملة:</b> <code>{symbol}</code>\n"
+            f"💰 <b>رأس المال:</b> <code>${self.cfg.capital:.2f}</code>\n"
+            f"📈 <b>سعر الدخول:</b> <code>{state.entry_price:.8g}</code>\n"
+            f"📦 <b>الكمية الكلية:</b> <code>{state.filled_qty:.4f}</code>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🎯 <b>خطة الخروج</b>\n"
+            f"TP1 (+{tp1_pct:.1f}%): <code>{state.tp1:.8g}</code> — بيع 20% ({state.qty_tp1:.4f}) على المنصة\n"
+            f"TP2 (+{tp2_pct:.1f}%): <code>{state.tp2:.8g}</code> — بيع 40% ({state.qty_tp2:.4f}) برمجائي\n"
+            f"TP3 (+{tp3_pct:.1f}%): <code>{state.tp3:.8g}</code> — بيع الكل المتبقي برمجائي\n"
+            f"🛡️ SL (-{sl_pct:.1f}%): <code>{state.stop_loss:.8g}</code> — برمجائي صامت\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"💼 الرصيد قبل: <code>${initial_balance:.2f}</code> | بعد: <code>${current_balance:.2f}</code>\n"
+            f"🧠 Committee: DS={result['ds_vote']} | Llama={result['llama_vote']} | RSS={rss_sentiment}\n"
+            f"⏱️ زمن التحليل: {result['elapsed']}s"
         )
 
 
