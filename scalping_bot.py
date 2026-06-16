@@ -846,19 +846,25 @@ class TradeMonitor:
                     _log(f"[Shadow SL] cancel failed {symbol}: {e}")
                 await asyncio.sleep(0.5)
 
-            # Sell remaining (qty_tp2 + qty_tp3 not yet sold)
+            # حساب الكمية المتبقية الفعلية — يستبعد ما تم بيعه من TP
             remaining = 0.0
+            if not state.tp1_filled: remaining += state.qty_tp1
             if not state.tp2_filled: remaining += state.qty_tp2
             if not state.tp3_filled: remaining += state.qty_tp3
-            if state.tp1_filled is False:  remaining += state.qty_tp1
             if remaining <= 0:
                 remaining = state.filled_qty
+
+            _log(
+                f"[Shadow SL] {symbol}: "
+                f"tp1={state.tp1_filled} tp2={state.tp2_filled} tp3={state.tp3_filled}"
+                f" → بيع {remaining:.4f} عملة"
+            )
 
             await loop.run_in_executor(
                 None, self.executor.emergency_market_sell, symbol, remaining
             )
             self.slots.release(symbol)
-            await self._notify_exit(state, "SL", curr_price, state.qty_tp1 + state.qty_tp2 + state.qty_tp3)
+            await self._notify_exit(state, "SL", curr_price, remaining)
             return
 
         # ── TP1 Physical Fill Check ──
