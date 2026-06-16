@@ -42,6 +42,7 @@ class Config:
     cmc_api_key:        str   = field(default_factory=lambda: os.environ.get("COINMARKETCAP_API_KEY", ""))
     coingecko_api_key:  str   = field(default_factory=lambda: os.environ.get("COINGECKO_API_KEY", ""))
     lunar_api_key:      str   = field(default_factory=lambda: os.environ.get("LUNARCRUSH_API_KEY", ""))
+    database_url:       str   = field(default_factory=lambda: os.environ.get("DATABASE_URL", ""))
 
     capital:            float = field(default_factory=lambda: float(os.environ.get("TRADE_INVESTMENT_AMOUNT", "30")))
     max_slots:          int   = field(default_factory=lambda: int(os.environ.get("MAX_CONCURRENT_TRADES", "3")))
