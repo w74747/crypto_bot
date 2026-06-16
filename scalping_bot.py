@@ -20,6 +20,12 @@ from typing import Optional
 import aiohttp
 import ccxt
 import pandas as pd
+try:
+    import psycopg2
+    import psycopg2.extras
+    _PSYCOPG2_OK = True
+except ImportError:
+    _PSYCOPG2_OK = False
 
 
 # ─────────────────────────────────────────────
@@ -72,6 +78,138 @@ def _format_duration(start_time: float) -> str:
     return f"{s}s"
 
 
+# ─────────────────────────────────────────────
+# TRADE LOGGER — Supabase integration
+# ─────────────────────────────────────────────
+class TradeLogger:
+    """
+    يسجّل كل صفقة في Supabase:
+    - يُنشئ سجلاً عند الشراء
+    - يُحدّثه عند كل خروج (TP1/TP2/TP3/SL)
+    - يوفر إجمالي أرباح الشهر الحالي
+    """
+
+    def __init__(self, database_url: str):
+        self.db_url   = database_url
+        self._enabled = bool(database_url and _PSYCOPG2_OK)
+        if self._enabled:
+            _log("[DB] ✅ TradeLogger متصل بـ Supabase")
+        else:
+            _log("[DB] ⚠️ TradeLogger معطّل (لا DATABASE_URL أو psycopg2)")
+
+    def _get_conn(self):
+        return psycopg2.connect(self.db_url, sslmode="require")
+
+    def insert_trade(
+        self,
+        state:             "SlotState",
+        capital:           float,
+        ds_vote:           str = "—",
+        llama_vote:        str = "—",
+        rss_sentiment:     str = "—",
+        galaxy_score:      float = 0.0,
+        committee_summary: str = "",
+    ) -> str | None:
+        """يُنشئ سجلاً جديداً عند الشراء. يُعيد الـ UUID."""
+        if not self._enabled:
+            return None
+        try:
+            conn = self._get_conn()
+            cur  = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO trades
+                    (symbol, opened_at, capital, filled_qty, entry_price,
+                     tp1, tp2, tp3, stop_loss, ds_vote, llama_vote,
+                     rss_sentiment, galaxy_score, committee_summary)
+                VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    state.symbol, capital, state.filled_qty, state.entry_price,
+                    state.tp1, state.tp2, state.tp3, state.stop_loss,
+                    ds_vote, llama_vote, rss_sentiment, galaxy_score,
+                    committee_summary,
+                ),
+            )
+            trade_id = str(cur.fetchone()[0])
+            conn.commit()
+            cur.close()
+            conn.close()
+            _log(f"[DB] ✅ صفقة مُسجَّلة: {state.symbol} | ID: {trade_id[:8]}...")
+            return trade_id
+        except Exception as e:
+            _log(f"[DB] ❌ insert_trade: {e}")
+            return None
+
+    def update_exit(
+        self,
+        trade_id:   str | None,
+        exit_type:  str,
+        exit_price: float,
+        exit_qty:   float,
+        net_pnl:    float,
+        net_pnl_pct: float,
+        total_fees: float,
+        duration_sec: int,
+        notes:      str = "",
+    ):
+        """يُحدِّث السجل عند الخروج (TP أو SL)."""
+        if not self._enabled or not trade_id:
+            return
+        try:
+            conn = self._get_conn()
+            cur  = conn.cursor()
+            cur.execute(
+                """
+                UPDATE trades SET
+                    closed_at     = NOW(),
+                    exit_type     = %s,
+                    exit_price    = %s,
+                    exit_qty      = %s,
+                    net_pnl_usd   = %s,
+                    net_pnl_pct   = %s,
+                    total_fees    = %s,
+                    duration_sec  = %s,
+                    notes         = %s
+                WHERE id = %s
+                """,
+                (
+                    exit_type, exit_price, exit_qty,
+                    net_pnl, net_pnl_pct, total_fees,
+                    duration_sec, notes, trade_id,
+                ),
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            _log(f"[DB] ✅ تحديث خروج: {exit_type} | PnL={net_pnl:+.3f}")
+        except Exception as e:
+            _log(f"[DB] ❌ update_exit: {e}")
+
+    def get_monthly_pnl(self) -> dict:
+        """إجمالي أرباح الشهر الحالي من Supabase."""
+        if not self._enabled:
+            return {"total_pnl": 0.0, "trades": 0, "wins": 0, "losses": 0}
+        try:
+            conn = self._get_conn()
+            cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT * FROM current_month_summary LIMIT 1")
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            if row:
+                return {
+                    "total_pnl": float(row["total_pnl_usd"] or 0),
+                    "trades":    int(row["total_trades"] or 0),
+                    "wins":      int(row["winning_trades"] or 0),
+                    "losses":    int(row["losing_trades"] or 0),
+                }
+        except Exception as e:
+            _log(f"[DB] ❌ get_monthly_pnl: {e}")
+        return {"total_pnl": 0.0, "trades": 0, "wins": 0, "losses": 0}
+
+
 MEXC_HEADER = "\U0001f7e6 <b>\u0627\u0644\u0645\u0646\u0635\u0629: MEXC</b>\n"
 
 
@@ -99,10 +237,11 @@ class SlotState:
     tp1_filled:           bool  = False
     tp2_filled:           bool  = False
     tp3_filled:           bool  = False
-    entry_time:           float = field(default_factory=time.time)  # ms precision
+    entry_time:           float = field(default_factory=time.time)
     opened_at:            float = field(default_factory=time.time)
     break_even_attempted: bool  = False
     extended:             bool  = False
+    db_trade_id:          str   = ""  # Supabase UUID
 
 
 class SlotManager:
@@ -786,10 +925,11 @@ class HighSpeedExecutor:
 # ─────────────────────────────────────────────
 class TradeMonitor:
 
-    def __init__(self, cfg: Config, executor: HighSpeedExecutor, slot_mgr: SlotManager):
+    def __init__(self, cfg: Config, executor: HighSpeedExecutor, slot_mgr: SlotManager, db: "TradeLogger | None" = None):
         self.cfg      = cfg
         self.executor = executor
         self.slots    = slot_mgr
+        self.db       = db
         self._running = False
 
     async def start(self):
@@ -1203,6 +1343,29 @@ class TradeMonitor:
         qty_pct_map = {"TP1": "20%", "TP2": "40%", "TP3": "الكل المتبقي", "SL": "الكل المتبقي"}
         qty_pct_str = qty_pct_map.get(exit_type, "—")
 
+        # ── تسجيل الخروج في Supabase ──
+        notes = ""
+        if exit_type == "SL":
+            notes = f"Shadow SL — السعر وصل {exit_price:.8g} ≤ SL {state.stop_loss:.8g}"
+        elif exit_type in ("TP2", "TP3"):
+            notes = f"Shadow {exit_type} — بيع برمجائي عند {exit_price:.8g}"
+
+        if self.db and state.db_trade_id:
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: self.db.update_exit(
+                    trade_id     = state.db_trade_id,
+                    exit_type    = exit_type,
+                    exit_price   = exit_price,
+                    exit_qty     = exit_qty,
+                    net_pnl      = net_pnl_usd,
+                    net_pnl_pct  = net_pnl_pct,
+                    total_fees   = total_fees_usd,
+                    duration_sec = int(time.time() - state.entry_time),
+                    notes        = notes,
+                )
+            )
+
         await self._notify(
             f"{label}\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1247,7 +1410,8 @@ class ScalpingOrchestrator:
         self.pipeline               = DataPipeline(cfg)
         self.committee              = ConsensusCommittee(cfg)
         self.executor               = HighSpeedExecutor(cfg)
-        self.monitor                = TradeMonitor(cfg, self.executor, self.slots)
+        self.db                     = TradeLogger(cfg.database_url)
+        self.monitor                = TradeMonitor(cfg, self.executor, self.slots, self.db)
         self._processing_symbols:   set[str] = set()
         self._processing_lock:      threading.Lock = threading.Lock()
 
@@ -1531,8 +1695,30 @@ class ScalpingOrchestrator:
 
         self.slots.occupy(state)
 
-        # جلب الرصيد الحالي بعد التنفيذ
+        # ── تسجيل الصفقة في Supabase ──
+        committee_summary = (
+            f"RSI تشبع بيعي | DeepSeek={result['ds_vote']} | "
+            f"Llama={result['llama_vote']} | RSS={rss_sentiment} | "
+            f"Galaxy={lunar_data.get('galaxy_score', 0):.0f}"
+        )
+        trade_id = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: self.db.insert_trade(
+                state             = state,
+                capital           = self.cfg.capital,
+                ds_vote           = result["ds_vote"],
+                llama_vote        = result["llama_vote"],
+                rss_sentiment     = rss_sentiment,
+                galaxy_score      = float(lunar_data.get("galaxy_score", 0)),
+                committee_summary = committee_summary,
+            )
+        )
+        if trade_id:
+            self.slots.update_state(symbol, db_trade_id=trade_id)
+
+        # ── جلب الرصيد الحالي + أرباح الشهر ──
         current_balance = 0.0
+        monthly = {"total_pnl": 0.0, "trades": 0, "wins": 0}
         try:
             bal             = self.executor.exchange.fetch_balance({"type": "spot"})
             current_balance = float(
@@ -1541,11 +1727,18 @@ class ScalpingOrchestrator:
             )
         except Exception:
             pass
+        monthly = await asyncio.get_running_loop().run_in_executor(
+            None, self.db.get_monthly_pnl
+        )
 
         tp1_pct = (state.tp1 / state.entry_price - 1) * 100
         tp2_pct = (state.tp2 / state.entry_price - 1) * 100
         tp3_pct = (state.tp3 / state.entry_price - 1) * 100
         sl_pct  = (1 - state.stop_loss / state.entry_price) * 100
+
+        m_pnl   = monthly.get("total_pnl", 0.0)
+        m_count = monthly.get("trades", 0)
+        m_sign  = "+" if m_pnl >= 0 else ""
 
         await self._send_telegram(
             "🚀 <b>صفقة جديدة — تم الدخول</b>\n"
@@ -1556,15 +1749,17 @@ class ScalpingOrchestrator:
             f"📦 <b>الكمية الكلية:</b> <code>{state.filled_qty:.4f}</code>\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "🎯 <b>خطة الخروج</b>\n"
-            f"TP1 (+{tp1_pct:.1f}%): <code>{state.tp1:.8g}</code> — بيع 20% ({state.qty_tp1:.4f}) على المنصة\n"
-            f"TP2 (+{tp2_pct:.1f}%): <code>{state.tp2:.8g}</code> — بيع 40% ({state.qty_tp2:.4f}) برمجائي\n"
-            f"TP3 (+{tp3_pct:.1f}%): <code>{state.tp3:.8g}</code> — بيع الكل المتبقي برمجائي\n"
-            f"🛡️ SL (-{sl_pct:.1f}%): <code>{state.stop_loss:.8g}</code> — برمجائي صامت\n\n"
+            f"TP1 (+{tp1_pct:.1f}%): <code>{state.tp1:.8g}</code> — 20% ({state.qty_tp1:.4f})\n"
+            f"TP2 (+{tp2_pct:.1f}%): <code>{state.tp2:.8g}</code> — 40% ({state.qty_tp2:.4f})\n"
+            f"TP3 (+{tp3_pct:.1f}%): <code>{state.tp3:.8g}</code>\n"
+            f"🛡 SL (-{sl_pct:.1f}%): <code>{state.stop_loss:.8g}</code>\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"💼 الرصيد قبل: <code>${initial_balance:.2f}</code> | بعد: <code>${current_balance:.2f}</code>\n"
+            f"💼 الرصيد: <code>${initial_balance:.2f}</code> → <code>${current_balance:.2f}</code>\n"
+            f"📊 إجمالي أرباح الشهر: <code>${m_sign}{m_pnl:.2f}</code> ({m_count} صفقة)\n"
             f"🧠 Committee: DS={result['ds_vote']} | Llama={result['llama_vote']} | RSS={rss_sentiment}\n"
-            f"⏱️ زمن التحليل: {result['elapsed']}s"
+            f"⏱️ {result['elapsed']}s"
         )
+
 
 
     async def scan_loop(self):
