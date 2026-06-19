@@ -964,6 +964,26 @@ class TradeMonitor:
             )
             curr_price = float(ticker.get("last") or ticker.get("close") or 0)
         except Exception as e:
+            err = str(e)
+            # ── Delisted symbol detection — code -1121 "invalid symbol" ──
+            # المنصة حذفت الزوج بالكامل؛ لا يمكن جلب سعر أو بيع. تحرير الـ
+            # slot فوراً مع تنبيه واحد فقط يمنع التكرار اللانهائي.
+            if "-1121" in err or "invalid symbol" in err.lower():
+                _log(
+                    f"[Delisted] 🚫 {symbol}: الزوج غير موجود على المنصة "
+                    f"(تم شطبه/حذفه) — تحرير الـ slot نهائياً"
+                )
+                self.slots.release(symbol)
+                await self._notify(
+                    "🚫 <b>عملة محذوفة من المنصة</b>\n\n"
+                    f"• <b>العملة:</b> <code>{symbol}</code>\n"
+                    "• <b>السبب:</b> الزوج غير متوفر على MEXC (delisted) — "
+                    "لا يمكن جلب السعر أو البيع تلقائياً\n\n"
+                    "<i>تحقق يدوياً من حساب MEXC إذا كان هناك رصيد متبقٍ "
+                    "من هذه العملة وتصرف معه حسب الحاجة. تم تحرير الـ slot "
+                    "ولن يُعاد التنبيه لهذه الصفقة.</i>"
+                )
+                return
             _log(f"[Monitor] price fetch failed {symbol}: {e}")
             return
 
@@ -1104,12 +1124,41 @@ class TradeMonitor:
         for state in states:
             symbol         = state.symbol
             open_order_ids: set = set()
+
+            # ── Delisted check — skip audit entirely if symbol vanished ──
+            if symbol not in self.executor.exchange.markets:
+                _log(
+                    f"[Reconcile] 🚫 {symbol}: غير موجود في قائمة الأسواق "
+                    f"(محتمل حذف) — تحرير الـ slot نهائياً"
+                )
+                self.slots.release(symbol)
+                await self._notify(
+                    "🚫 <b>عملة محذوفة من المنصة</b>\n\n"
+                    f"• <b>العملة:</b> <code>{symbol}</code>\n"
+                    "• <b>السبب:</b> الزوج غير متوفر على MEXC (delisted)\n\n"
+                    "<i>تحقق يدوياً من حساب MEXC. تم تحرير الـ slot ولن "
+                    "يُعاد التنبيه لهذه الصفقة.</i>"
+                )
+                continue
+
             try:
                 orders = await asyncio.get_running_loop().run_in_executor(
                     None, self.executor.exchange.fetch_open_orders, symbol
                 )
                 open_order_ids = {str(o["id"]) for o in orders}
             except Exception as e:
+                err = str(e)
+                if "-1121" in err or "invalid symbol" in err.lower():
+                    _log(f"[Reconcile] 🚫 {symbol}: invalid symbol — تحرير الـ slot")
+                    self.slots.release(symbol)
+                    await self._notify(
+                        "🚫 <b>عملة محذوفة من المنصة</b>\n\n"
+                        f"• <b>العملة:</b> <code>{symbol}</code>\n"
+                        "• <b>السبب:</b> الزوج غير متوفر على MEXC (delisted)\n\n"
+                        "<i>تحقق يدوياً من حساب MEXC. تم تحرير الـ slot ولن "
+                        "يُعاد التنبيه لهذه الصفقة.</i>"
+                    )
+                    continue
                 _log(f"[Reconcile] فشل جلب أوامر {symbol}: {e}")
 
             await self._audit_slot(state, open_order_ids)
@@ -1803,6 +1852,14 @@ class ScalpingOrchestrator:
             # ── Market Scanner — runs only when balance is sufficient ──
             if scanner_active:
                 try:
+                    # تحديث قائمة الأسواق كل دورة — يكشف الرموز المحذوفة
+                    # (delisted) قبل محاولة شرائها، ويمنع التداول على
+                    # أزواج أُزيلت من المنصة منذ آخر إعادة تشغيل
+                    try:
+                        self.executor.exchange.load_markets(reload=True)
+                    except Exception as e:
+                        _log(f"[Scan] load_markets reload failed: {e}")
+
                     markets = self.executor.exchange.markets
                     symbols = []
                     for s, mkt in markets.items():
