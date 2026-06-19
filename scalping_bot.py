@@ -42,6 +42,7 @@ class Config:
     cmc_api_key:        str   = field(default_factory=lambda: os.environ.get("COINMARKETCAP_API_KEY", ""))
     coingecko_api_key:  str   = field(default_factory=lambda: os.environ.get("COINGECKO_API_KEY", ""))
     lunar_api_key:      str   = field(default_factory=lambda: os.environ.get("LUNARCRUSH_API_KEY", ""))
+    whale_alert_api_key: str  = field(default_factory=lambda: os.environ.get("WHALE_ALERT_API_KEY", ""))
     database_url:       str   = field(default_factory=lambda: os.environ.get("DATABASE_URL", ""))
 
     capital:            float = field(default_factory=lambda: float(os.environ.get("TRADE_INVESTMENT_AMOUNT", "30")))
@@ -412,34 +413,100 @@ class DataPipeline:
 
     async def get_rss_sentiment(self, session: aiohttp.ClientSession) -> str:
         """
-        Fetches macro/geopolitical RSS from CoinDesk.
+        نظام أخبار متعدد المصادر — يستبدل الاعتماد على CoinDesk فقط
+        بمزيج من 3 مصادر RSS موثوقة معاً، لتقليل التحيز لمصدر واحد
+        وزيادة دقة قراءة المزاج العام للسوق.
+
         Returns 'bullish' | 'bearish' | 'neutral'.
         """
+        sources = [
+            "https://www.coindesk.com/arc/outboundfeeds/rss/",
+            "https://cointelegraph.com/rss",
+            "https://decrypt.co/feed",
+        ]
+
+        bearish_kw = ["crash", "ban", "hack", "liquidat", "regulation", "lawsuit",
+                      "fear", "dump", "plunge", "collapse", "crisis", "recession",
+                      "exploit", "rug pull", "investigation", "sec sues", "delist"]
+        bullish_kw = ["rally", "surge", "bull", "adoption", "etf", "institutional",
+                      "breakout", "all-time high", "accumulate", "upgrade",
+                      "partnership", "integration", "approval", "inflow"]
+
+        total_bear = 0
+        total_bull = 0
+        fetched    = 0
+
+        for url in sources:
+            try:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=6)
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    text = (await resp.text()).lower()
+                    total_bear += sum(text.count(w) for w in bearish_kw)
+                    total_bull += sum(text.count(w) for w in bullish_kw)
+                    fetched += 1
+            except Exception:
+                continue
+
+        if fetched == 0:
+            # فشل كل المصادر — fail-safe: محايد، لا يرفض ولا يوافق بقوة
+            _log("[RSS Multi-Source] كل المصادر فشلت — neutral (fail-safe)")
+            return "neutral"
+
+        if total_bear > total_bull + 5:
+            return "bearish"
+        elif total_bull > total_bear + 2:
+            return "bullish"
+        return "neutral"
+
+    async def get_whale_activity(self, session: aiohttp.ClientSession, symbol: str) -> dict:
+        """
+        يفحص حركات المحافظ الضخمة (Whale Movements) لعملة محددة عبر
+        Whale Alert API. هذا يكشف بيع/شراء ضخم قد يسبق حركة سعرية
+        كبيرة — مؤشر مبكر لا تعكسه مؤشرات RSI أو فيبوناتشي بعد.
+
+        Returns {"whale_alert": "sell"|"buy"|"none", "transactions": int}
+        يتطلب WHALE_ALERT_API_KEY — في غيابه يُعاد "none" بأمان (fail-safe).
+        """
+        if not self.cfg.whale_alert_api_key:
+            return {"whale_alert": "none", "transactions": 0}
+
+        coin = symbol.split("/")[0].split("_")[0].lower()
         try:
             async with session.get(
-                "https://www.coindesk.com/arc/outboundfeeds/rss/",
+                "https://api.whale-alert.io/v1/transactions",
+                params={
+                    "api_key": self.cfg.whale_alert_api_key,
+                    "currency": coin,
+                    "min_value": "500000",
+                    "limit": "10",
+                },
                 timeout=aiohttp.ClientTimeout(total=6),
             ) as resp:
                 if resp.status != 200:
-                    return "neutral"
-                text = await resp.text()
+                    return {"whale_alert": "none", "transactions": 0}
+                data = await resp.json()
+                txs  = data.get("transactions", [])
+                if not txs:
+                    return {"whale_alert": "none", "transactions": 0}
 
-            bearish_kw = ["crash", "ban", "hack", "liquidat", "regulation", "lawsuit",
-                          "fear", "dump", "plunge", "collapse", "crisis", "recession"]
-            bullish_kw = ["rally", "surge", "bull", "adoption", "etf", "institutional",
-                          "breakout", "all-time", "accumulate", "upgrade"]
+                # تحويلات لمنصات تداول (exchange) تشير غالباً لنية بيع
+                to_exchange   = sum(1 for t in txs if t.get("to", {}).get("owner_type") == "exchange")
+                from_exchange = sum(1 for t in txs if t.get("from", {}).get("owner_type") == "exchange")
 
-            text_lower = text.lower()
-            bear_hits  = sum(text_lower.count(w) for w in bearish_kw)
-            bull_hits  = sum(text_lower.count(w) for w in bullish_kw)
+                if to_exchange > from_exchange:
+                    signal = "sell"   # حيتان تنقل لمنصات — احتمال بيع قادم
+                elif from_exchange > to_exchange:
+                    signal = "buy"    # حيتان تسحب من منصات — احتمال تجميع/شراء
+                else:
+                    signal = "none"
 
-            if bear_hits > bull_hits + 3:
-                return "bearish"
-            elif bull_hits > bear_hits:
-                return "bullish"
-            return "neutral"
-        except Exception:
-            return "neutral"
+                return {"whale_alert": signal, "transactions": len(txs)}
+        except Exception as e:
+            _log(f"[Whale Alert] {coin}: {str(e)[:60]} — none (fail-safe)")
+            return {"whale_alert": "none", "transactions": 0}
 
     async def layer1_pass(
         self,
@@ -695,9 +762,11 @@ class ConsensusCommittee:
         rss_sentiment: str,
         lunar_data:    dict,
         support:       dict = None,
+        whale_data:    dict = None,
     ) -> dict:
         start = time.time()
         support = support or {"has_support": False, "touches": 0, "support_level": 0.0}
+        whale_data = whale_data or {"whale_alert": "none", "transactions": 0}
 
         support_line = (
             f"Horizontal Support: {support['touches']} historical touches near "
@@ -714,12 +783,19 @@ class ConsensusCommittee:
             f"support as a positive confluence factor if present. "
             f"Last line: BUY or SKIP"
         )
+        whale_line = (
+            f"Whale Activity: {whale_data['transactions']} large transactions detected, "
+            f"signal={whale_data['whale_alert']} "
+            f"({'large transfers TO exchanges — possible sell pressure' if whale_data['whale_alert']=='sell' else 'large transfers FROM exchanges — possible accumulation' if whale_data['whale_alert']=='buy' else 'no significant whale signal'})"
+        )
         llama_msg = (
             f"Symbol: {symbol} | RSI: {rsi:.1f}\n"
             f"Macro RSS Sentiment: {rss_sentiment}\n"
             f"LunarCrush Galaxy Score: {lunar_data.get('galaxy_score', 50):.0f}\n"
             f"Social Volume 24h: {lunar_data.get('social_volume', 0)}\n"
-            f"Is macro environment safe for a scalp entry? Last line: BUY or SKIP"
+            f"{whale_line}\n"
+            f"Is macro environment safe for a scalp entry? Whale 'sell' signal should "
+            f"weigh negatively. Last line: BUY or SKIP"
         )
 
         async with aiohttp.ClientSession() as session:
@@ -1797,6 +1873,7 @@ class ScalpingOrchestrator:
         # ── Fetch auxiliary data for committee ──
         lunar_data = await self.pipeline.get_lunar_score(session, symbol)
         rss_sentiment = await self.pipeline.get_rss_sentiment(session)
+        whale_data = await self.pipeline.get_whale_activity(session, symbol)
 
         # ── Layer 2: Consensus Committee (DeepSeek + Llama-3.3) ──
         support_data = ind.get("support", {"has_support": False, "touches": 0, "support_level": 0.0})
@@ -1810,7 +1887,14 @@ class ScalpingOrchestrator:
             rss_sentiment = rss_sentiment,
             lunar_data    = lunar_data,
             support       = support_data,
+            whale_data    = whale_data,
         )
+
+        if whale_data.get("whale_alert") != "none":
+            _log(
+                f"[Whale] {symbol}: signal={whale_data['whale_alert']} "
+                f"({whale_data['transactions']} معاملات ضخمة)"
+            )
 
         if support_data.get("has_support"):
             _log(
@@ -1982,6 +2066,10 @@ class ScalpingOrchestrator:
             + (
                 f"📍 دعم أفقي مؤكَّد: {support_data['touches']} لمسات سابقة\n"
                 if support_data.get("has_support") else ""
+            )
+            + (
+                f"🐋 نشاط حيتان: {whale_data['whale_alert']} ({whale_data['transactions']} معاملة)\n"
+                if whale_data.get("whale_alert") != "none" else ""
             )
             + f"⏱️ {result['elapsed']}s"
         )
