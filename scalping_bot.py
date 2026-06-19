@@ -49,7 +49,7 @@ class Config:
     scan_interval:      int   = field(default_factory=lambda: int(os.environ.get("SCAN_INTERVAL_MINUTES", "60")))
     rsi_threshold:      int   = field(default_factory=lambda: int(os.environ.get("RSI_OVERSOLD_THRESHOLD", "31")))
     min_volume_usd:     float = field(default_factory=lambda: float(os.environ.get("MIN_DAILY_VOLUME_USD", "1000000")))
-    cmc_top_rank:       int   = field(default_factory=lambda: int(os.environ.get("CMC_TOP_RANK", "500")))
+    cmc_top_rank:       int   = field(default_factory=lambda: int(os.environ.get("CMC_TOP_RANK", "300")))
     monitor_interval:   int   = 30
     max_ai_tokens:      int   = 150
     deepseek_model:     str   = field(default_factory=lambda: os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"))
@@ -290,10 +290,12 @@ class SlotManager:
 # 3. DATA PIPELINE — CMC + CoinGecko + LunarCrush + RSS
 # ─────────────────────────────────────────────
 class DataPipeline:
-    _cmc_cache:    dict = {}
-    _lunar_cache:  dict = {}
-    _gecko_cache:  dict = {}
-    _CACHE_TTL:    float = 3600.0
+    _cmc_cache:      dict = {}
+    _cmc_bulk_cache: dict = {}   # {"ts": ..., "data": {COIN: {volume_24h, rank}}}
+    _lunar_cache:    dict = {}
+    _gecko_cache:    dict = {}
+    _CACHE_TTL:      float = 3600.0
+    _CMC_BULK_TTL:   float = 1800.0  # نصف ساعة — توازن بين دقة البيانات وتوفير الحصة
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -307,36 +309,72 @@ class DataPipeline:
     def _cache_set(self, store: dict, key: str, data):
         store[key] = {"ts": time.time(), "data": data}
 
-    async def get_cmc_data(self, session: aiohttp.ClientSession, symbol: str) -> dict:
-        """Returns {volume_24h, rank}. Bypasses if no API key."""
-        coin   = symbol.split("/")[0].split("_")[0].upper()
-        cached = self._cache_get(self._cmc_cache, coin)
-        if cached is not None:
+    async def _fetch_cmc_bulk(self, session: aiohttp.ClientSession) -> dict:
+        """
+        استدعاء واحد فقط يجلب أعلى 500 عملة دفعة واحدة، بدل استدعاء
+        منفصل لكل عملة. هذا يوفّر حصة CMC الشهرية بشكل كبير (استدعاء
+        واحد كل 30 دقيقة بدل مئات/آلاف الاستدعاءات الفردية يومياً).
+        """
+        cached = self._cmc_bulk_cache.get("data")
+        if cached is not None and (time.time() - self._cmc_bulk_cache.get("ts", 0)) < self._CMC_BULK_TTL:
             return cached
 
         if not self.cfg.cmc_api_key:
-            return {"volume_24h": self.cfg.min_volume_usd, "rank": 1}
+            return {}
 
         try:
             async with session.get(
-                "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest",
+                "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
                 headers={"X-CMC_PRO_API_KEY": self.cfg.cmc_api_key},
-                params={"symbol": coin, "convert": "USD"},
-                timeout=aiohttp.ClientTimeout(total=6),
+                params={"start": "1", "limit": "500", "convert": "USD"},
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status != 200:
-                    return {"volume_24h": self.cfg.min_volume_usd, "rank": 1}
-                data  = await resp.json()
-                entry = data.get("data", {}).get(coin, {})
-                quote = entry.get("quote", {}).get("USD", {})
-                result = {
-                    "volume_24h": float(quote.get("volume_24h", 0)),
-                    "rank":       int(entry.get("cmc_rank", 9999)),
-                }
-                self._cache_set(self._cmc_cache, coin, result)
+                    _log(f"[CMC Bulk] HTTP {resp.status} — استخدام الكاش القديم إن وجد")
+                    return self._cmc_bulk_cache.get("data", {})
+
+                payload = await resp.json()
+                result  = {}
+                for entry in payload.get("data", []):
+                    coin  = entry.get("symbol", "").upper()
+                    quote = entry.get("quote", {}).get("USD", {})
+                    result[coin] = {
+                        "volume_24h": float(quote.get("volume_24h", 0)),
+                        "rank":       int(entry.get("cmc_rank", 9999)),
+                        "valid":      True,
+                    }
+
+                self._cmc_bulk_cache["ts"]   = time.time()
+                self._cmc_bulk_cache["data"] = result
+                _log(f"[CMC Bulk] ✅ تحديث — {len(result)} عملة (استدعاء واحد فقط)")
                 return result
-        except Exception:
-            return {"volume_24h": self.cfg.min_volume_usd, "rank": 1}
+
+        except Exception as e:
+            _log(f"[CMC Bulk] فشل: {str(e)[:80]} — استخدام الكاش القديم إن وجد")
+            return self._cmc_bulk_cache.get("data", {})
+
+    async def get_cmc_data(self, session: aiohttp.ClientSession, symbol: str) -> dict:
+        """
+        Returns {volume_24h, rank, valid}.
+
+        يقرأ من الكاش الجماعي (bulk) المُحدَّث كل 30 دقيقة بدل استدعاء
+        API منفصل لكل عملة. هذا يوفّر الحصة الشهرية بنسبة كبيرة جداً.
+
+        FAIL-SAFE: عملة غير موجودة في القائمة الجماعية (خارج Top 500
+        فعلياً) أو فشل الجلب بالكامل → valid=False → تُرفض، بدل قبولها
+        تلقائياً كما كان يحدث سابقاً.
+        """
+        coin = symbol.split("/")[0].split("_")[0].upper()
+
+        if not self.cfg.cmc_api_key:
+            return {"volume_24h": 0.0, "rank": 9999, "valid": False}
+
+        bulk_data = await self._fetch_cmc_bulk(session)
+        if coin in bulk_data:
+            return bulk_data[coin]
+
+        # العملة غير موجودة في Top 500 — رفض مباشر وموثوق
+        return {"volume_24h": 0.0, "rank": 9999, "valid": False}
 
     async def get_lunar_score(self, session: aiohttp.ClientSession, symbol: str) -> dict:
         """Returns {galaxy_score, social_volume, vote}."""
@@ -416,6 +454,12 @@ class DataPipeline:
         cmc_task   = self.get_cmc_data(session, symbol)
         lunar_task = self.get_lunar_score(session, symbol)
         cmc, lunar = await asyncio.gather(cmc_task, lunar_task)
+
+        # ── Fail-Safe: بيانات CMC غير صالحة (مفتاح معطل/فشل شبكة) ──
+        # نرفض العملة بدل المرور التلقائي الذي كان يحدث سابقاً عبر
+        # قيمة افتراضية وهمية (rank=1) — هذا كان يُفرغ الفلتر من قيمته
+        if not cmc.get("valid", False):
+            return False, "CMC غير متاح — رفض احتياطي (fail-safe)"
 
         if cmc["volume_24h"] < self.cfg.min_volume_usd:
             return False, f"CMC Vol ${cmc['volume_24h']/1e6:.1f}M < min"
