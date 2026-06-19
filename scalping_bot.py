@@ -480,29 +480,43 @@ class DataPipeline:
 # 4. FIBONACCI ENGINE
 # ─────────────────────────────────────────────
 def calculate_cascading_targets(fib_high: float, fib_low: float, entry: float) -> dict:
-    """Cascading caps guarantee entry < tp1 < tp2 < tp3."""
+    """
+    Cascading Fibonacci targets — تضمن entry < tp1 < tp2 < tp3.
+
+    إصلاح جذري (الإصدار النهائي): المشكلة الأصلية لم تكن فقط في الكاب
+    الصارم (15%)، بل في تسلسل الاعتماد بين الأهداف (tp2 = max(tp2_c,
+    tp1 × 1.03)) — بما أن tp1 النهائي يُثبَّت غالباً عند +5% (floor
+    مطلوب ومتعمد لاحقاً في execute_full_trade)، فإن أي ربط لـ tp2/tp3
+    بقيمة tp1 يُسقط تنوعهما الديناميكي معه بالتسلسل، فتظهر كل الأهداف
+    شبه ثابتة دائماً (5% / 8.2% / ...) بغض النظر عن حركة العملة الفعلية.
+
+    الحل: كل هدف يُحسب من فيبوناتشي الخاص به فقط، بدون اعتماد على
+    الهدف الذي قبله. الترتيب الصحيح (tp1 < tp2 < tp3) يُفرض فقط في
+    أضيق الحالات الاستثنائية (تقاطع نادر)، لا كقاعدة عامة تُطبَّق دائماً.
+    """
     fib_range = fib_high - fib_low
-    if fib_range > 0:
+    if fib_range > 0 and fib_high > entry:
         tp1_c = fib_low + fib_range * 0.382
         tp2_c = fib_low + fib_range * 0.500
         tp3_c = fib_low + fib_range * 0.618
     else:
-        tp1_c = entry * 1.03
-        tp2_c = entry * 1.06
-        tp3_c = entry * 1.12
+        tp1_c = entry * 1.05
+        tp2_c = entry * 1.10
+        tp3_c = entry * 1.18
 
-    cap = entry * 1.15
-    tp1 = max(tp1_c, entry * 1.03)
-    tp2 = max(tp2_c, tp1   * 1.03)
-    tp3 = max(tp3_c, tp2   * 1.03)
-    tp1 = min(tp1, cap * 0.78)
-    tp2 = min(tp2, cap * 0.90)
-    tp3 = min(tp3, cap)
+    hard_cap = entry * 1.45  # سقف مطلق واسع يمنع أهدافاً غير واقعية فقط
 
-    if not (entry < tp1 < tp2 < tp3):
-        tp1 = round(entry * 1.03, 10)
-        tp2 = round(entry * 1.06, 10)
-        tp3 = round(entry * 1.12, 10)
+    # كل هدف مستقل تماماً عن الآخر — لا تسلسل اعتماد بينها
+    tp1 = min(max(tp1_c, entry * 1.001), hard_cap)
+    tp2 = min(max(tp2_c, entry * 1.001), hard_cap)
+    tp3 = min(max(tp3_c, entry * 1.001), hard_cap)
+
+    # فرض الترتيب الصحيح فقط عند التقاطع الفعلي (نادر إحصائياً)، بفجوة
+    # دنيا 1% بين كل هدف والذي يليه، دون كسر القيم الديناميكية السليمة
+    if tp2 <= tp1:
+        tp2 = tp1 * 1.01
+    if tp3 <= tp2:
+        tp3 = tp2 * 1.01
 
     return {"tp1": round(tp1, 10), "tp2": round(tp2, 10), "tp3": round(tp3, 10)}
 
@@ -510,7 +524,55 @@ def calculate_cascading_targets(fib_high: float, fib_low: float, entry: float) -
 # ─────────────────────────────────────────────
 # 5. DYNAMIC SL — pure 15m swing low, no AI
 # ─────────────────────────────────────────────
-def calculate_micro_swing_sl(exchange: ccxt.mexc, symbol: str, entry_price: float) -> float:
+def detect_horizontal_support(df: pd.DataFrame, current_price: float, tolerance_pct: float = 0.015) -> dict:
+    """
+    يكشف مستويات الدعم الأفقي الحقيقية — نقاط سعرية لمسها السعر
+    عدة مرات وارتد منها صعوداً خلال آخر 90 يوماً.
+
+    الفكرة (Confluence): صفقة يتوافق فيها RSI + فيبوناتشي + دعم أفقي
+    تاريخي معاً أقوى من صفقة تعتمد على مؤشر واحد فقط. هذا لا يستبدل
+    فيبوناتشي، بل يضيف تأكيداً مستقلاً عليه.
+
+    الطريقة: نجمع كل القيعان المحلية (swing lows) في النافذة، ثم
+    نتحقق هل القاع الحالي يقع ضمن "كتلة" من قيعان سابقة متقاربة
+    (بتفاوت tolerance_pct) — إن وُجدت ≥ 2 لمسات سابقة، فهذا دعم
+    حقيقي مؤكَّد إحصائياً، لا نقطة عشوائية.
+    """
+    try:
+        lows = df["low"].tail(90).values
+        if len(lows) < 10:
+            return {"has_support": False, "touches": 0, "support_level": 0.0}
+
+        # القيعان المحلية فقط (swing lows) — تجنّب الضجيج
+        swing_lows = [
+            lows[i] for i in range(2, len(lows) - 2)
+            if lows[i] < lows[i-1] and lows[i] < lows[i-2]
+            and lows[i] < lows[i+1] and lows[i] < lows[i+2]
+        ]
+        if not swing_lows:
+            return {"has_support": False, "touches": 0, "support_level": 0.0}
+
+        # تجميع القيعان القريبة من السعر الحالي (ضمن tolerance) لمعرفة
+        # كم مرة "لمس" السعر هذا المستوى تقريباً
+        nearby = [
+            low for low in swing_lows
+            if abs(low - current_price) / current_price <= tolerance_pct
+        ]
+
+        touches = len(nearby)
+        avg_level = sum(nearby) / touches if touches > 0 else 0.0
+
+        # دعم "حقيقي" يتطلب لمستين سابقتين على الأقل (وليس مجرد نقطة عابرة)
+        return {
+            "has_support":   touches >= 2,
+            "touches":       touches,
+            "support_level": avg_level,
+        }
+    except Exception:
+        return {"has_support": False, "touches": 0, "support_level": 0.0}
+
+
+
     """
     Stop-loss يعتمد على آخر swing low حقيقي على فريم 15 دقيقة،
     بدل قيمة ثابتة 5% للجميع. القيمة الثابتة كانت تُضرب بسرعة في
@@ -632,14 +694,25 @@ class ConsensusCommittee:
         fib_low:       float,
         rss_sentiment: str,
         lunar_data:    dict,
+        support:       dict = None,
     ) -> dict:
         start = time.time()
+        support = support or {"has_support": False, "touches": 0, "support_level": 0.0}
+
+        support_line = (
+            f"Horizontal Support: {support['touches']} historical touches near "
+            f"{support['support_level']:.8g} — "
+            f"{'CONFIRMED (strong confluence)' if support['has_support'] else 'none detected'}"
+        )
 
         ds_msg = (
             f"Symbol: {symbol} | RSI: {rsi:.1f} | Entry: {entry:.8g}\n"
             f"Local High: {fib_high:.8g} | Local Low: {fib_low:.8g}\n"
             f"Volume 24h: ${vol_m:.1f}M\n"
-            f"Evaluate technical oversold setup. Last line: BUY or SKIP"
+            f"{support_line}\n"
+            f"Evaluate technical oversold setup, weighting confirmed horizontal "
+            f"support as a positive confluence factor if present. "
+            f"Last line: BUY or SKIP"
         )
         llama_msg = (
             f"Symbol: {symbol} | RSI: {rsi:.1f}\n"
@@ -944,21 +1017,28 @@ class HighSpeedExecutor:
         if not buy:
             return None
 
+        # ── Enforce minimum +5% floor on TP1 BEFORE placing the order ──
+        # (سابقاً كان الأمر الفعلي على المنصة يُنفَّذ بـ tp1 الأصلي
+        # قبل رفعه، فيُمكن أن يُنفَّذ بسعر أقل من +5% المقصود فعلياً)
+        effective_tp1 = max(tp1, entry_price * 1.05)
+        if effective_tp1 != tp1:
+            _log(f"[Hybrid] {symbol}: TP1 lifted from {tp1:.8g} → {effective_tp1:.8g} (floor +5%)")
+
+        # إعادة فحص ترتيب tp2/tp3 ضد القيمة النهائية المُصحَّحة لـ tp1
+        # (يمنع كسر الترتيب الذي كان يحدث عند رفع tp1 بعد حساب tp2/tp3)
+        effective_tp2 = tp2 if tp2 > effective_tp1 else effective_tp1 * 1.02
+        effective_tp3 = tp3 if tp3 > effective_tp2 else effective_tp2 * 1.02
+
         bracket = {}
         try:
             bracket = self.place_tp_sl(
-                symbol, buy["filled_qty"], buy["filled_price"], tp1, stop_loss
+                symbol, buy["filled_qty"], buy["filled_price"], effective_tp1, stop_loss
             )
         except Exception as e:
             _log(f"[Executor] place_tp_sl error {symbol}: {e}")
 
         # Entry fee: 0.1% taker on market buy
         entry_fee = self.cfg.capital * 0.001
-
-        # Enforce minimum +5% floor on TP1
-        effective_tp1 = max(tp1, buy["filled_price"] * 1.05)
-        if effective_tp1 != tp1:
-            _log(f"[Hybrid] {symbol}: TP1 lifted from {tp1:.8g} → {effective_tp1:.8g} (floor +5%)")
 
         return SlotState(
             symbol       = symbol,
@@ -968,8 +1048,8 @@ class HighSpeedExecutor:
             entry_price  = buy["filled_price"],
             filled_qty   = buy["filled_qty"],
             tp1          = effective_tp1,
-            tp2          = tp2,
-            tp3          = tp3,
+            tp2          = effective_tp2,
+            tp3          = effective_tp3,
             stop_loss    = stop_loss,
             entry_fee    = entry_fee,
             qty_tp1      = bracket.get("qty_tp1", buy["filled_qty"] * 0.30),
@@ -1656,6 +1736,7 @@ class ScalpingOrchestrator:
             rsi     = self._calc_rsi(closes)
             fib_high = float(df["high"].tail(60).max())
             fib_low  = float(df["low"].tail(60).min())
+            support  = detect_horizontal_support(df, current)
             vol_usd  = 0.0
             try:
                 t       = self.executor.exchange.fetch_ticker(symbol)
@@ -1667,7 +1748,8 @@ class ScalpingOrchestrator:
             except Exception:
                 pass
             return {"current": current, "rsi": rsi,
-                    "fib_high": fib_high, "fib_low": fib_low, "vol_usd": vol_usd}
+                    "fib_high": fib_high, "fib_low": fib_low, "vol_usd": vol_usd,
+                    "support": support}
         except Exception as e:
             _log(f"[Scan] ❌ {symbol}: {type(e).__name__}: {str(e)[:80]}")
             return None
@@ -1717,6 +1799,7 @@ class ScalpingOrchestrator:
         rss_sentiment = await self.pipeline.get_rss_sentiment(session)
 
         # ── Layer 2: Consensus Committee (DeepSeek + Llama-3.3) ──
+        support_data = ind.get("support", {"has_support": False, "touches": 0, "support_level": 0.0})
         result = await self.committee.run(
             symbol        = symbol,
             rsi           = ind["rsi"],
@@ -1726,7 +1809,14 @@ class ScalpingOrchestrator:
             fib_low       = ind["fib_low"],
             rss_sentiment = rss_sentiment,
             lunar_data    = lunar_data,
+            support       = support_data,
         )
+
+        if support_data.get("has_support"):
+            _log(
+                f"[Support] {symbol}: دعم أفقي مؤكَّد — "
+                f"{support_data['touches']} لمسات سابقة عند {support_data['support_level']:.8g}"
+            )
 
         if not result["approved"]:
             _log(
@@ -1889,7 +1979,11 @@ class ScalpingOrchestrator:
             f"💼 الرصيد: <code>${initial_balance:.2f}</code> → <code>${current_balance:.2f}</code>\n"
             f"📊 إجمالي أرباح الشهر: <code>${m_sign}{m_pnl:.2f}</code> ({m_count} صفقة)\n"
             f"🧠 Committee: DS={result['ds_vote']} | Llama={result['llama_vote']} | RSS={rss_sentiment}\n"
-            f"⏱️ {result['elapsed']}s"
+            + (
+                f"📍 دعم أفقي مؤكَّد: {support_data['touches']} لمسات سابقة\n"
+                if support_data.get("has_support") else ""
+            )
+            + f"⏱️ {result['elapsed']}s"
         )
 
 
