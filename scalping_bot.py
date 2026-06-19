@@ -300,6 +300,7 @@ class DataPipeline:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self._cmc_bulk_lock = asyncio.Lock()
 
     def _cache_get(self, store: dict, key: str):
         e = store.get(key)
@@ -313,8 +314,18 @@ class DataPipeline:
     async def _fetch_cmc_bulk(self, session: aiohttp.ClientSession) -> dict:
         """
         استدعاء واحد فقط يجلب أعلى 500 عملة دفعة واحدة، بدل استدعاء
-        منفصل لكل عملة. هذا يوفّر حصة CMC الشهرية بشكل كبير (استدعاء
-        واحد كل 30 دقيقة بدل مئات/آلاف الاستدعاءات الفردية يومياً).
+        منفصل لكل عملة. هذا يوفّر حصة CMC الشهرية بشكل كبير.
+
+        إصلاح حرج: بدون قفل (lock)، عندما تُفحص عدة عملات بالتوازي
+        (asyncio.gather على batch) والكاش فارغ، كل عملة تستدعي هذه
+        الدالة في نفس اللحظة بالضبط — فيصل عشرات الطلبات لـ CMC API
+        دفعة واحدة، فيرفضها CMC بـ HTTP 429 (Too Many Requests) قبل
+        أن يكتمل أي طلب وتُعبأ نتيجته في الكاش. النتيجة: رفض كل
+        العملات بشكل متكرر دون أن ينجح أي استدعاء أبداً.
+
+        الحل: قفل asyncio.Lock يضمن أن استدعاء واحد فقط يصل CMC API
+        فعلياً؛ كل الاستدعاءات الأخرى المتزامنة تنتظر حتى يكتمل الأول
+        وتُملأ نتيجته في الكاش، ثم تقرأ منه مباشرة بدلاً من تكرار الطلب.
         """
         cached = self._cmc_bulk_cache.get("data")
         if cached is not None and (time.time() - self._cmc_bulk_cache.get("ts", 0)) < self._CMC_BULK_TTL:
@@ -323,35 +334,55 @@ class DataPipeline:
         if not self.cfg.cmc_api_key:
             return {}
 
-        try:
-            async with session.get(
-                "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
-                headers={"X-CMC_PRO_API_KEY": self.cfg.cmc_api_key},
-                params={"start": "1", "limit": "500", "convert": "USD"},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    _log(f"[CMC Bulk] HTTP {resp.status} — استخدام الكاش القديم إن وجد")
-                    return self._cmc_bulk_cache.get("data", {})
+        async with self._cmc_bulk_lock:
+            # إعادة الفحص بعد الحصول على القفل — قد يكون طلب آخر
+            # (كان ينتظر القفل) قد أكمل التحديث بالفعل أثناء الانتظار
+            cached = self._cmc_bulk_cache.get("data")
+            if cached is not None and (time.time() - self._cmc_bulk_cache.get("ts", 0)) < self._CMC_BULK_TTL:
+                return cached
 
-                payload = await resp.json()
-                result  = {}
-                for entry in payload.get("data", []):
-                    coin  = entry.get("symbol", "").upper()
-                    quote = entry.get("quote", {}).get("USD", {})
-                    result[coin] = {
-                        "volume_24h": float(quote.get("volume_24h", 0)),
-                        "rank":       int(entry.get("cmc_rank", 9999)),
-                        "valid":      True,
-                    }
+            for attempt in range(3):
+                try:
+                    async with session.get(
+                        "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
+                        headers={"X-CMC_PRO_API_KEY": self.cfg.cmc_api_key},
+                        params={"start": "1", "limit": "500", "convert": "USD"},
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        if resp.status == 429:
+                            wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                            _log(f"[CMC Bulk] HTTP 429 — إعادة محاولة بعد {wait}s ({attempt+1}/3)")
+                            await asyncio.sleep(wait)
+                            continue
 
-                self._cmc_bulk_cache["ts"]   = time.time()
-                self._cmc_bulk_cache["data"] = result
-                _log(f"[CMC Bulk] ✅ تحديث — {len(result)} عملة (استدعاء واحد فقط)")
-                return result
+                        if resp.status != 200:
+                            _log(f"[CMC Bulk] HTTP {resp.status} — استخدام الكاش القديم إن وجد")
+                            return self._cmc_bulk_cache.get("data", {})
 
-        except Exception as e:
-            _log(f"[CMC Bulk] فشل: {str(e)[:80]} — استخدام الكاش القديم إن وجد")
+                        payload = await resp.json()
+                        result  = {}
+                        for entry in payload.get("data", []):
+                            coin  = entry.get("symbol", "").upper()
+                            quote = entry.get("quote", {}).get("USD", {})
+                            result[coin] = {
+                                "volume_24h": float(quote.get("volume_24h", 0)),
+                                "rank":       int(entry.get("cmc_rank", 9999)),
+                                "valid":      True,
+                            }
+
+                        self._cmc_bulk_cache["ts"]   = time.time()
+                        self._cmc_bulk_cache["data"] = result
+                        _log(f"[CMC Bulk] ✅ تحديث — {len(result)} عملة (استدعاء واحد فقط)")
+                        return result
+
+                except Exception as e:
+                    _log(f"[CMC Bulk] محاولة {attempt+1} فشلت: {str(e)[:60]}")
+                    await asyncio.sleep(1)
+
+            # كل المحاولات الثلاث فشلت (429 متكرر أو خطأ آخر) — استخدام
+            # الكاش القديم إن وُجد، أو قائمة فارغة (يرفض كل العملات
+            # بأمان عبر fail-safe بدل قبولها بدون تحقق)
+            _log("[CMC Bulk] فشلت 3 محاولات — استخدام الكاش القديم إن وجد")
             return self._cmc_bulk_cache.get("data", {})
 
     async def get_cmc_data(self, session: aiohttp.ClientSession, symbol: str) -> dict:
