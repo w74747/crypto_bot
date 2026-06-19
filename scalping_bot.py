@@ -467,6 +467,14 @@ def calculate_cascading_targets(fib_high: float, fib_low: float, entry: float) -
 # 5. DYNAMIC SL — pure 15m swing low, no AI
 # ─────────────────────────────────────────────
 def calculate_micro_swing_sl(exchange: ccxt.mexc, symbol: str, entry_price: float) -> float:
+    """
+    Stop-loss يعتمد على آخر swing low حقيقي على فريم 15 دقيقة،
+    بدل قيمة ثابتة 5% للجميع. القيمة الثابتة كانت تُضرب بسرعة في
+    عملات متقلبة لأن SL كان قريباً جداً من سعر الدخول، مما يقطع
+    الصفقة قبل أن تصل لـ TP1 بفرصة كافية.
+
+    النطاق المسموح الآن: -4% إلى -8% (بدل تثبيت دقيق عند -5%)
+    """
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe="15m", limit=48)
         if not ohlcv or len(ohlcv) < 5:
@@ -481,11 +489,11 @@ def calculate_micro_swing_sl(exchange: ccxt.mexc, symbol: str, entry_price: floa
         local_low = min(swing_lows[-3:]) if swing_lows else float(lows[-5:].min())
         sl = local_low * 0.998
     except Exception as e:
-        _log(f"[SL Calc] {symbol} fallback 5%: {e}")
-        sl = entry_price * 0.95
+        _log(f"[SL Calc] {symbol} fallback 6%: {e}")
+        sl = entry_price * 0.94
 
-    # Enforce strict 5% max risk below entry
-    sl = max(entry_price * 0.95, min(sl, entry_price * 0.995))
+    # نطاق مرن: لا أقرب من -4% (يمنع الضرب السريع)، لا أبعد من -8% (يحدّ الخسارة القصوى)
+    sl = max(entry_price * 0.92, min(sl, entry_price * 0.96))
     return sl
 
 
@@ -524,8 +532,13 @@ class ConsensusCommittee:
         user_msg: str,
         label:    str,
     ) -> str:
+        # ── FAIL-SAFE: عدم توفر مفتاح أو فشل API يجب أن يمنع الصفقة ──
+        # (سابقاً كان يُعيد "BUY" تلقائياً عند أي فشل — هذا كان يسمح
+        # بدخول صفقات بدون أي تحليل فعلي من Committee، وهو سبب جذري
+        # محتمل لارتفاع نسبة صفقات SL)
         if not api_key:
-            return "BUY"   # bypass if key not configured
+            _log(f"[{label}] مفتاح API غير مُعرَّف — SKIP (fail-safe)")
+            return "SKIP"
         try:
             async with session.post(
                 f"{base_url}/chat/completions",
@@ -543,18 +556,19 @@ class ConsensusCommittee:
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
                 if resp.status == 429:
-                    _log(f"[{label}] 429 Rate Limit — bypass")
-                    return "BUY"
+                    _log(f"[{label}] 429 Rate Limit — SKIP (fail-safe)")
+                    return "SKIP"
                 if resp.status != 200:
-                    return "BUY"
+                    _log(f"[{label}] HTTP {resp.status} — SKIP (fail-safe)")
+                    return "SKIP"
                 data = await resp.json()
                 return data["choices"][0]["message"]["content"] or ""
         except asyncio.TimeoutError:
-            _log(f"[{label}] Timeout")
-            return "BUY"
+            _log(f"[{label}] Timeout — SKIP (fail-safe)")
+            return "SKIP"
         except Exception as e:
-            _log(f"[{label}] {str(e)[:60]}")
-            return "BUY"
+            _log(f"[{label}] {str(e)[:60]} — SKIP (fail-safe)")
+            return "SKIP"
 
     def _verdict(self, text: str) -> str:
         if not text:
@@ -1721,6 +1735,30 @@ class ScalpingOrchestrator:
                     f"${self.cfg.capital:.2f}). Halting batch loop."
                 )
                 return  # silent — no Telegram notification
+
+            # ── One-Position-Per-Symbol Guard ──
+            # يمنع شراء عملة موجودة بالفعل في المحفظة (سواء في الذاكرة
+            # كـ slot نشط، أو كرصيد حقيقي على المنصة من صفقة سابقة لم
+            # تُسجَّل بعد في الذاكرة بسبب إعادة تشغيل أو سباق توقيت).
+            # بدون هذا الفحص يمكن أن يتراكم رأس المال على عملة واحدة
+            # حتى يتجاوز $100 أو $200 رغم أن الحد المقصود لكل عملة هو
+            # صفقة واحدة بقيمة $100 فقط.
+            base_asset = symbol.split("/")[0]
+            existing_qty = float(
+                bal_check.get(base_asset, {}).get("total", 0) or
+                bal_check.get("total", {}).get(base_asset, 0) or 0
+            )
+            if existing_qty > 0:
+                try:
+                    asset_value_usd = existing_qty * entry_price
+                except Exception:
+                    asset_value_usd = 0.0
+                if asset_value_usd > 1.0:  # تجاهل أتربة (dust) أقل من $1
+                    _log(
+                        f"[One-Position Guard] {symbol}: رصيد موجود بالفعل "
+                        f"({existing_qty:.4f} ≈ ${asset_value_usd:.2f}) — منع صفقة مكررة"
+                    )
+                    return
         except ccxt.NetworkError as e:
             _log(f"[Local Balance Guard] NetworkError: {e}")
         except ccxt.ExchangeError as e:
