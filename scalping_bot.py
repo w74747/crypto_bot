@@ -714,7 +714,7 @@ class ConsensusCommittee:
 
     DS_SYSTEM = (
         "You are a crypto technical analyst. Evaluate the oversold setup strictly. "
-        "Check: RSI < 25 AND price near/below lower Bollinger Band. "
+        "Check: RSI < 30 AND price near/below lower Bollinger Band. "
         "Respond with exactly one word on the last line: BUY or SKIP."
     )
     LLAMA_SYSTEM = (
@@ -1238,7 +1238,7 @@ class TradeMonitor:
         # ── Shadow SL Monitor ──
         if state.stop_loss > 0 and curr_price <= state.stop_loss:
             _log(
-                f"[Shadow SL] 🛑 {symbol}: curr={curr_price:.8g} "
+                f"[Shadow SL] 🔻 {symbol}: curr={curr_price:.8g} "
                 f"≤ SL={state.stop_loss:.8g} — liquidating remaining qty"
             )
             # Cancel any open TP1 to free locked qty
@@ -1515,7 +1515,7 @@ class TradeMonitor:
             net_pnl_pct    = (net_pnl_usd / (entry * filled_qty)) * 100 if entry > 0 else 0.0
             sign_p = "+" if net_pnl_usd >= 0 else ""
             sign_c = "+" if net_pnl_pct >= 0 else ""
-            emoji  = "✅" if net_pnl_usd >= 0 else "\U0001f534"
+            emoji  = "✅" if net_pnl_usd >= 0 else "🔻"
             pnl_line = (
                 f"• <b>رسوم المنصة الإجمالية:</b> <code>${total_fees_usd:.4f}</code>\n"
                 f"• <b>النتيجة الصافية الحقيقية:</b> {emoji} "
@@ -1616,7 +1616,7 @@ class TradeMonitor:
         net_pnl_usd    = gross_pnl_usd - total_fees_usd
         net_pnl_pct    = (net_pnl_usd / (entry * exit_qty)) * 100 if entry > 0 and exit_qty > 0 else 0.0
 
-        emoji     = "✅" if net_pnl_usd >= 0 else "🔴"
+        emoji     = "✅" if net_pnl_usd >= 0 else "🔻"
         sign_pnl  = "+" if net_pnl_usd >= 0 else ""
         sign_pct  = "+" if net_pnl_pct >= 0 else ""
         duration  = _format_duration(state.entry_time)
@@ -1625,7 +1625,7 @@ class TradeMonitor:
             "TP1": "🎯 TP1 وصل الهدف (30% — منصة)",
             "TP2": "🎯 TP2 وصل الهدف (20% — برمجائي)",
             "TP3": "🏆 TP3 وصل الهدف (20% — برمجائي)",
-            "SL":  "🛑 وقف الخسارة (Shadow SL)",
+            "SL":  "🔻 وقف الخسارة (Shadow SL)",
         }
         label = labels.get(exit_type, f"📌 {exit_type}")
 
