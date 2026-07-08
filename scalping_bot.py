@@ -701,6 +701,36 @@ def detect_horizontal_support(df: pd.DataFrame, current_price: float, tolerance_
     return sl
 
 
+
+
+def calculate_micro_swing_sl(exchange, symbol: str, entry_price: float) -> float:
+    """
+    Stop-loss يعتمد على آخر swing low حقيقي على فريم 15 دقيقة،
+    بدل قيمة ثابتة للجميع.
+    النطاق المسموح: -4% إلى -8% من سعر الدخول.
+    """
+    try:
+        import pandas as pd
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe="15m", limit=48)
+        if not ohlcv or len(ohlcv) < 5:
+            raise ValueError("insufficient candles")
+        df   = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"]).astype(float)
+        lows = df["low"].values
+        swing_lows = [
+            lows[i] for i in range(2, len(lows) - 2)
+            if lows[i] < lows[i-1] and lows[i] < lows[i-2]
+            and lows[i] < lows[i+1] and lows[i] < lows[i+2]
+        ]
+        local_low = min(swing_lows[-3:]) if swing_lows else float(lows[-5:].min())
+        sl = local_low * 0.998
+    except Exception as e:
+        _log(f"[SL Calc] {symbol} fallback 6%: {e}")
+        sl = entry_price * 0.94
+
+    # نطاق مرن: لا أقرب من -4%، لا أبعد من -8%
+    sl = max(entry_price * 0.92, min(sl, entry_price * 0.96))
+    return sl
+
 # ─────────────────────────────────────────────
 # 6. CONSENSUS COMMITTEE — DeepSeek + Llama-3.3 unanimous
 # ─────────────────────────────────────────────
@@ -714,7 +744,8 @@ class ConsensusCommittee:
 
     DS_SYSTEM = (
         "You are a crypto technical analyst. Evaluate the oversold setup strictly. "
-        "Check: RSI < 30 AND price near/below lower Bollinger Band. "
+        "Primary signal: RSI < 30 (oversold). Secondary confirmation: price near or below lower Bollinger Band is a plus but not required. "
+        "If RSI is clearly oversold (below 25), lean BUY unless there is a strong reason not to. "
         "Respond with exactly one word on the last line: BUY or SKIP."
     )
     LLAMA_SYSTEM = (
