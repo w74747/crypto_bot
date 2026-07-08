@@ -61,10 +61,21 @@ class Config:
     sl_retry_attempts:        int   = 3
     disable_timeout_liquidation: bool = True  # Positions run until TP or Shadow SL — no time-based liquidation
     blacklisted_assets: set   = field(default_factory=lambda: {
+        # ── إقراض بفائدة (Lending/Interest protocols) ──
         "AAVE", "COMP", "MKR", "CRV", "LDO", "UNI", "SUSHI", "BAL",
-        "CAKE", "YFI", "SNX", "DYDX", "ANC", "FUN", "WIN", "DICE",
-        "BET", "RLB", "POLS", "MANA", "SAND", "GALA", "AXS", "SLP",
-        "XMR", "DASH", "ZEC"
+        "CAKE", "YFI", "SNX", "DYDX", "ANC",
+        "ALPHA", "VENUS", "CREAM", "PENDLE", "RADIANT", "EULER", "FLUID",
+        # ── قمار وميسر (Gambling) ──
+        "FUN", "WIN", "DICE", "BET", "RLB", "POLS",
+        "CHIP", "SLOT", "LOTTO", "LUCKY", "DERC",
+        # ── محتوى إباحي (Adult content) ──
+        "NSFW", "ADULTS", "FANTASY", "STRIP",
+        # ── Metaverse/NFT Gaming محل إشكال ──
+        "MANA", "SAND", "GALA", "AXS", "SLP",
+        # ── خصوصية مطلقة (Privacy coins) ──
+        "XMR", "DASH", "ZEC",
+        # ── Leveraged tokens (رافعة مالية) ──
+        "BULL", "BEAR", "UP", "DOWN",
     })
 
 
@@ -2138,6 +2149,146 @@ class ScalpingOrchestrator:
 
 
 
+
+    async def _check_api_health(self):
+        """
+        يفحص كل APIs الخارجية ويُرسل تنبيه Telegram واحد إذا توقف أي منها
+        (انتهاء رصيد، تجاوز الحد، مفتاح خاطئ، timeout).
+        يُستدعى مرة واحدة في بداية كل دورة سكان.
+        """
+        issues = []
+
+        async with aiohttp.ClientSession() as session:
+
+            # ── DeepSeek ──
+            if self.cfg.deepseek_api_key:
+                try:
+                    async with session.post(
+                        "https://api.deepseek.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {self.cfg.deepseek_api_key}",
+                                 "Content-Type": "application/json"},
+                        json={"model": self.cfg.deepseek_model, "max_tokens": 1,
+                              "messages": [{"role": "user", "content": "hi"}]},
+                        timeout=aiohttp.ClientTimeout(total=8),
+                    ) as resp:
+                        if resp.status == 402:
+                            issues.append("💳 <b>DeepSeek:</b> رصيد منتهٍ (402)")
+                        elif resp.status == 429:
+                            issues.append("⏱ <b>DeepSeek:</b> تجاوز الحد المسموح (429)")
+                        elif resp.status == 401:
+                            issues.append("🔑 <b>DeepSeek:</b> مفتاح API خاطئ (401)")
+                        elif resp.status not in (200, 400):
+                            issues.append(f"⚠️ <b>DeepSeek:</b> HTTP {resp.status}")
+                except asyncio.TimeoutError:
+                    issues.append("⏱ <b>DeepSeek:</b> لا استجابة (timeout)")
+                except Exception as e:
+                    issues.append(f"⚠️ <b>DeepSeek:</b> {str(e)[:50]}")
+            else:
+                issues.append("🔑 <b>DeepSeek:</b> مفتاح API غير مُعرَّف")
+
+            # ── Together AI (Llama) ──
+            if self.cfg.together_api_key:
+                try:
+                    async with session.post(
+                        "https://api.together.xyz/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {self.cfg.together_api_key}",
+                                 "Content-Type": "application/json"},
+                        json={"model": self.cfg.together_model, "max_tokens": 1,
+                              "messages": [{"role": "user", "content": "hi"}]},
+                        timeout=aiohttp.ClientTimeout(total=8),
+                    ) as resp:
+                        if resp.status == 402:
+                            issues.append("💳 <b>Together AI (Llama):</b> رصيد منتهٍ (402)")
+                        elif resp.status == 429:
+                            issues.append("⏱ <b>Together AI (Llama):</b> تجاوز الحد المسموح (429)")
+                        elif resp.status == 401:
+                            issues.append("🔑 <b>Together AI (Llama):</b> مفتاح API خاطئ (401)")
+                        elif resp.status not in (200, 400):
+                            issues.append(f"⚠️ <b>Together AI (Llama):</b> HTTP {resp.status}")
+                except asyncio.TimeoutError:
+                    issues.append("⏱ <b>Together AI (Llama):</b> لا استجابة (timeout)")
+                except Exception as e:
+                    issues.append(f"⚠️ <b>Together AI (Llama):</b> {str(e)[:50]}")
+            else:
+                issues.append("🔑 <b>Together AI (Llama):</b> مفتاح API غير مُعرَّف")
+
+            # ── CoinMarketCap ──
+            if self.cfg.cmc_api_key:
+                try:
+                    async with session.get(
+                        "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
+                        headers={"X-CMC_PRO_API_KEY": self.cfg.cmc_api_key},
+                        params={"limit": "1"},
+                        timeout=aiohttp.ClientTimeout(total=8),
+                    ) as resp:
+                        if resp.status == 401:
+                            issues.append("🔑 <b>CoinMarketCap:</b> مفتاح API خاطئ (401)")
+                        elif resp.status == 402:
+                            issues.append("💳 <b>CoinMarketCap:</b> الحد الشهري منتهٍ (402)")
+                        elif resp.status == 429:
+                            issues.append("⏱ <b>CoinMarketCap:</b> تجاوز الحد المسموح (429)")
+                        elif resp.status not in (200,):
+                            issues.append(f"⚠️ <b>CoinMarketCap:</b> HTTP {resp.status}")
+                except asyncio.TimeoutError:
+                    issues.append("⏱ <b>CoinMarketCap:</b> لا استجابة (timeout)")
+                except Exception as e:
+                    issues.append(f"⚠️ <b>CoinMarketCap:</b> {str(e)[:50]}")
+            else:
+                issues.append("🔑 <b>CoinMarketCap:</b> مفتاح API غير مُعرَّف")
+
+            # ── LunarCrush ──
+            if self.cfg.lunar_api_key:
+                try:
+                    async with session.get(
+                        "https://lunarcrush.com/api4/public/coins/btc/v1",
+                        headers={"Authorization": f"Bearer {self.cfg.lunar_api_key}"},
+                        timeout=aiohttp.ClientTimeout(total=8),
+                    ) as resp:
+                        if resp.status == 401:
+                            issues.append("🔑 <b>LunarCrush:</b> مفتاح API خاطئ (401)")
+                        elif resp.status == 402:
+                            issues.append("💳 <b>LunarCrush:</b> رصيد منتهٍ (402)")
+                        elif resp.status == 429:
+                            issues.append("⏱ <b>LunarCrush:</b> تجاوز الحد المسموح (429)")
+                        elif resp.status not in (200,):
+                            issues.append(f"⚠️ <b>LunarCrush:</b> HTTP {resp.status}")
+                except asyncio.TimeoutError:
+                    issues.append("⏱ <b>LunarCrush:</b> لا استجابة (timeout)")
+                except Exception as e:
+                    issues.append(f"⚠️ <b>LunarCrush:</b> {str(e)[:50]}")
+
+            # ── CoinGecko ──
+            if self.cfg.coingecko_api_key:
+                try:
+                    async with session.get(
+                        "https://pro-api.coingecko.com/api/v3/ping",
+                        headers={"x-cg-pro-api-key": self.cfg.coingecko_api_key},
+                        timeout=aiohttp.ClientTimeout(total=8),
+                    ) as resp:
+                        if resp.status == 401:
+                            issues.append("🔑 <b>CoinGecko:</b> مفتاح API خاطئ (401)")
+                        elif resp.status == 429:
+                            issues.append("⏱ <b>CoinGecko:</b> تجاوز الحد المسموح (429)")
+                        elif resp.status not in (200,):
+                            issues.append(f"⚠️ <b>CoinGecko:</b> HTTP {resp.status}")
+                except asyncio.TimeoutError:
+                    issues.append("⏱ <b>CoinGecko:</b> لا استجابة (timeout)")
+                except Exception as e:
+                    issues.append(f"⚠️ <b>CoinGecko:</b> {str(e)[:50]}")
+
+        # ── إرسال التنبيه إن وُجدت مشاكل ──
+        if issues:
+            msg = (
+                "🔧 <b>تنبيه: أدوات متوقفة أو غير متاحة</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                + "\n".join(f"• {i}" for i in issues)
+                + "\n\n<i>راجع مفاتيح API في Railway وتأكد من الرصيد المتاح.</i>"
+            )
+            await self._send_telegram(msg)
+            _log(f"[API Health] ⚠️ {len(issues)} مشكلة مكتشفة — تنبيه أُرسل")
+        else:
+            _log("[API Health] ✅ كل الأدوات تعمل بشكل طبيعي")
+
     async def scan_loop(self):
         await self._send_telegram(
             "🤖 <b>Scalping Engine نشط</b>\n"
@@ -2151,6 +2302,9 @@ class ScalpingOrchestrator:
         while True:
             start = datetime.now()
             _log(f"🔄 Scan: {start.strftime('%Y-%m-%d %H:%M:%S')}")
+
+            # ── فحص صحة APIs في بداية كل دورة ──
+            await self._check_api_health()
 
             # ── Pre-Flight Balance Audit ──
             # Balance Guard يوقف البحث عن فرص جديدة فقط
@@ -2196,7 +2350,7 @@ class ScalpingOrchestrator:
                         base = s.split("/")[0].upper()
                         if base in self.cfg.blacklisted_assets:
                             continue
-                        if any(s.endswith(p) for p in ["3L/USDT","3S/USDT","5L/USDT","5S/USDT"]):
+                        if any(s.endswith(p) for p in ["3L/USDT","3S/USDT","5L/USDT","5S/USDT","UP/USDT","DOWN/USDT","BULL/USDT","BEAR/USDT"]):
                             continue
                         symbols.append(s)
 
