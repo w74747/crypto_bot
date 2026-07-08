@@ -1751,6 +1751,7 @@ class ScalpingOrchestrator:
         self.monitor                = TradeMonitor(cfg, self.executor, self.slots, self.db)
         self._processing_symbols:   set[str] = set()
         self._processing_lock:      threading.Lock = threading.Lock()
+        self._last_api_health_alert: float = 0.0  # آخر وقت أُرسل فيه تنبيه API health
 
     def _restore_open_positions(self):
         """
@@ -2269,6 +2270,8 @@ class ScalpingOrchestrator:
                             issues.append("🔑 <b>CoinGecko:</b> مفتاح API خاطئ (401)")
                         elif resp.status == 429:
                             issues.append("⏱ <b>CoinGecko:</b> تجاوز الحد المسموح (429)")
+                        elif resp.status == 400:
+                            pass  # 400 طبيعي مع Free tier — CoinGecko غير مستخدمة في القرارات
                         elif resp.status not in (200,):
                             issues.append(f"⚠️ <b>CoinGecko:</b> HTTP {resp.status}")
                 except asyncio.TimeoutError:
@@ -2276,16 +2279,25 @@ class ScalpingOrchestrator:
                 except Exception as e:
                     issues.append(f"⚠️ <b>CoinGecko:</b> {str(e)[:50]}")
 
-        # ── إرسال التنبيه إن وُجدت مشاكل ──
+        # ── إرسال التنبيه مرة كل 12 ساعة فقط (بدل كل دورة) ──
+        now = time.time()
+        alert_interval = 12 * 3600  # 12 ساعة
+
         if issues:
-            msg = (
-                "🔧 <b>تنبيه: أدوات متوقفة أو غير متاحة</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                + "\n".join(f"• {i}" for i in issues)
-                + "\n\n<i>راجع مفاتيح API في Railway وتأكد من الرصيد المتاح.</i>"
-            )
-            await self._send_telegram(msg)
-            _log(f"[API Health] ⚠️ {len(issues)} مشكلة مكتشفة — تنبيه أُرسل")
+            _log(f"[API Health] ⚠️ {len(issues)} مشكلة: {', '.join(i[:30] for i in issues)}")
+            if (now - self._last_api_health_alert) >= alert_interval:
+                msg = (
+                    "🔧 <b>تنبيه: أدوات متوقفة أو غير متاحة</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    + "\n".join(f"• {i}" for i in issues)
+                    + "\n\n<i>راجع مفاتيح API في Railway وتأكد من الرصيد المتاح.</i>"
+                )
+                await self._send_telegram(msg)
+                self._last_api_health_alert = now
+                _log("[API Health] تنبيه Telegram أُرسل — التالي بعد 12 ساعة")
+            else:
+                remaining = int((alert_interval - (now - self._last_api_health_alert)) / 3600)
+                _log(f"[API Health] تنبيه مؤجل — التالي بعد ~{remaining} ساعة")
         else:
             _log("[API Health] ✅ كل الأدوات تعمل بشكل طبيعي")
 
