@@ -200,6 +200,34 @@ class TradeLogger:
         except Exception as e:
             _log(f"[DB] ❌ update_exit: {e}")
 
+    def get_open_trades(self) -> list:
+        """
+        يسترد الصفقات المفتوحة (بدون closed_at) من Supabase.
+        يُعيد entry_price وstop_loss وtp1/tp2/tp3 الحقيقية
+        لاستخدامها في Restore بدل إعادة الحساب التقريبي.
+        """
+        if not self._enabled:
+            return []
+        try:
+            conn = self._get_conn()
+            cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(
+                """
+                SELECT id, symbol, entry_price, filled_qty,
+                       tp1, tp2, tp3, stop_loss
+                FROM trades
+                WHERE closed_at IS NULL
+                ORDER BY opened_at DESC
+                """
+            )
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+            return [dict(r) for r in rows] if rows else []
+        except Exception as e:
+            _log(f"[DB] ❌ get_open_trades: {e}")
+            return []
+
     def get_monthly_pnl(self) -> dict:
         """إجمالي أرباح الشهر الحالي من Supabase."""
         if not self._enabled:
@@ -1755,14 +1783,33 @@ class ScalpingOrchestrator:
 
     def _restore_open_positions(self):
         """
-        عند إعادة تشغيل البوت: يفحص MEXC ويسترد الصفقات المفتوحة
-        في الذاكرة حتى يعمل TradeMonitor على متابعتها.
+        عند إعادة تشغيل البوت: يسترد الصفقات المفتوحة بالبيانات الحقيقية.
 
-        يبحث عن أصول في الحساب تحتوي على Limit Sell orders مفتوحة
-        ويُعيد بناء SlotState بسيط لكل منها.
+        الأولوية:
+        1. Supabase — يجلب entry_price/stop_loss/tp1/tp2/tp3 الحقيقية
+           التي سُجِّلت لحظة الشراء، بدل إعادة الحساب التقريبي الذي
+           كان يُغلق صفقات سليمة بخطأ (مشكلة SEI -16% الوهمية)
+        2. Fallback — إذا لم تكن Supabase متاحة يُقدَّر SL ديناميكياً
+           من swing lows الفعلية على فريم 15 دقيقة
+
+        الأولوية الكاملة لحماية الصفقة المفتوحة — بغض النظر عن
+        القائمة السوداء (عملة محظورة فُتحت قبل التحديث تُحمى حتى تُغلق)
         """
         _log("[Restore] 🔄 فحص صفقات مفتوحة من إعادة التشغيل...")
         try:
+            # ── المرحلة 1: جلب البيانات الحقيقية من Supabase ──
+            db_trades = {}
+            if self.db and self.db._enabled:
+                raw = self.db.get_open_trades()
+                for row in raw:
+                    sym = row.get("symbol", "")
+                    if sym:
+                        db_trades[sym] = row
+                _log(f"[Restore] Supabase: {len(db_trades)} صفقة مفتوحة")
+            else:
+                _log("[Restore] Supabase غير متاح — سيُستخدم Fallback")
+
+            # ── المرحلة 2: فحص الرصيد الفعلي على MEXC ──
             bal      = self.executor.exchange.fetch_balance({"type": "spot"})
             balances = bal.get("total", {})
 
@@ -1771,50 +1818,102 @@ class ScalpingOrchestrator:
                 if asset in ("USDT", "USDC") or float(total_qty or 0) <= 0:
                     continue
 
-                # ── تجاهل الأصول المحظورة شرعياً ──
-                if asset.upper() in self.cfg.blacklisted_assets:
-                    _log(f"[Restore] ⛔ {asset} في قائمة الحظر — تجاهل")
+                # تجاهل Leveraged tokens
+                if any(asset.upper().endswith(p) for p in ["3L","3S","5L","5S"]):
                     continue
 
-                # ── تجاهل Leveraged tokens ──
-                if any(asset.upper().endswith(p) for p in ["3L","3S","5L","5S","UP","DOWN"]):
-                    _log(f"[Restore] ⛔ {asset} leveraged token — تجاهل")
-                    continue
-
-                # ── احترام حد الـ slots ──
                 if self.slots.used >= self.cfg.max_slots:
-                    _log(
-                        f"[Restore] وصل الحد الأقصى {self.cfg.max_slots} slots "
-                        f"— إيقاف الاسترداد"
-                    )
+                    _log(f"[Restore] وصل الحد الأقصى {self.cfg.max_slots} slots — إيقاف")
                     break
 
                 symbol = f"{asset}/USDT"
                 if symbol not in self.executor.exchange.markets:
                     continue
 
-                # جلب الأوامر المفتوحة
+                # تحقق من القيمة الفعلية — تجاهل الأتربة < $1
                 try:
-                    open_orders = self.executor.exchange.fetch_open_orders(symbol)
+                    ticker     = self.executor.exchange.fetch_ticker(symbol)
+                    live_price = float(ticker.get("last") or ticker.get("close") or 0)
+                    asset_value = float(total_qty) * live_price
                 except Exception:
+                    live_price  = 0.0
+                    asset_value = 0.0
+
+                if asset_value < 1.0:
                     continue
 
-                limit_sells = [o for o in open_orders if o.get("side") == "sell"]
-                if not limit_sells:
-                    continue
-
-                tp1_order  = limit_sells[0]
-                tp1_price  = float(tp1_order.get("price", 0))
                 filled_qty = float(total_qty)
 
-                # سعر الدخول التقريبي
-                approx_entry = tp1_price / 1.05 if tp1_price > 0 else 0
-                approx_sl    = approx_entry * 0.95 if approx_entry > 0 else 0
+                # ── جلب الأوامر المفتوحة لمعرفة حالة TP1 ──
+                tp1_order_id = ""
+                tp1_filled   = False
+                try:
+                    open_orders = self.executor.exchange.fetch_open_orders(symbol)
+                    limit_sells = [o for o in open_orders if o.get("side") == "sell"]
+                    if limit_sells:
+                        tp1_order_id = str(limit_sells[0].get("id", ""))
+                    else:
+                        tp1_filled = True
+                        _log(f"[Restore] {symbol}: لا limit sell — مرحلة TP2/TP3 shadow")
+                except Exception:
+                    tp1_filled = True
 
-                if approx_entry <= 0 or filled_qty <= 0:
-                    continue
+                # ── المرحلة 3: البيانات الحقيقية من Supabase أو Fallback ──
+                db_row = db_trades.get(symbol)
 
-                # إعادة بناء الـ qty split (20/40/40)
+                if db_row:
+                    # ✅ بيانات حقيقية من Supabase
+                    entry_price = float(db_row["entry_price"])
+                    stop_loss   = float(db_row["stop_loss"])
+                    tp1_val     = float(db_row["tp1"])
+                    tp2_val     = float(db_row["tp2"])
+                    tp3_val     = float(db_row["tp3"])
+                    db_trade_id = str(db_row["id"])
+                    source      = "Supabase ✅"
+                else:
+                    # ⚠️ Fallback: تقدير من السوق الحالي
+                    _log(f"[Restore] {symbol}: لا سجل في Supabase — Fallback")
+                    if live_price <= 0:
+                        continue
+
+                    # سعر الدخول: من TP1 إن وجد، أو تقدير من السعر الحالي
+                    open_orders_prices = []
+                    try:
+                        oo = self.executor.exchange.fetch_open_orders(symbol)
+                        open_orders_prices = [float(o["price"]) for o in oo if o.get("side") == "sell" and o.get("price")]
+                    except Exception:
+                        pass
+
+                    if open_orders_prices:
+                        tp1_val     = open_orders_prices[0]
+                        entry_price = tp1_val / 1.05
+                    else:
+                        entry_price = live_price
+                        tp1_val     = entry_price * 1.05
+
+                    # SL ديناميكي من swing lows
+                    try:
+                        stop_loss = calculate_micro_swing_sl(
+                            self.executor.exchange, symbol, entry_price
+                        )
+                    except Exception:
+                        stop_loss = entry_price * 0.94
+
+                    tp2_val     = tp1_val * 1.04
+                    tp3_val     = tp1_val * 1.08
+                    db_trade_id = ""
+                    source      = "Fallback ⚠️"
+
+                # ── تحقق أمان: SL لا يُغلق الصفقة فوراً ──
+                # إذا كان السعر الحالي أقل من SL بأكثر من 1% → SL خاطئ، اضبطه
+                if live_price > 0 and stop_loss >= live_price * 0.99:
+                    old_sl    = stop_loss
+                    stop_loss = live_price * 0.94  # fallback آمن -6%
+                    _log(
+                        f"[Restore] ⚠️ {symbol}: SL={old_sl:.6g} ≥ سعر حالي={live_price:.6g} "
+                        f"— تم تعديله لـ {stop_loss:.6g} (-6%) لمنع إغلاق فوري"
+                    )
+
                 qty_tp1 = round(filled_qty * 0.20, 6)
                 qty_tp2 = round(filled_qty * 0.40, 6)
                 qty_tp3 = round(filled_qty * 0.40, 6)
@@ -1822,24 +1921,30 @@ class ScalpingOrchestrator:
                 state = SlotState(
                     symbol       = symbol,
                     buy_order_id = "restored",
-                    tp1_order_id = str(tp1_order.get("id", "")),
-                    entry_price  = approx_entry,
+                    tp1_order_id = tp1_order_id,
+                    entry_price  = entry_price,
                     filled_qty   = filled_qty,
-                    tp1          = tp1_price,
-                    tp2          = tp1_price * 1.04,   # Fib تقريبي
-                    tp3          = tp1_price * 1.08,   # Fib تقريبي
-                    stop_loss    = approx_sl,
+                    tp1          = tp1_val,
+                    tp2          = tp2_val,
+                    tp3          = tp3_val,
+                    stop_loss    = stop_loss,
+                    tp1_filled   = tp1_filled,
                     qty_tp1      = qty_tp1,
                     qty_tp2      = qty_tp2,
                     qty_tp3      = qty_tp3,
+                    db_trade_id  = db_trade_id,
                     entry_time   = time.time(),
                 )
                 self.slots.occupy(state)
                 restored += 1
+
+                sl_pct  = (1 - stop_loss / entry_price) * 100 if entry_price > 0 else 0
+                tp_status = "TP1 مكتمل — shadow" if tp1_filled else f"TP1={tp1_val:.6g}"
+                blacklisted_note = " ⚠️ محظور — محمي حتى الإغلاق" if asset.upper() in self.cfg.blacklisted_assets else ""
                 _log(
-                    f"[Restore] ✅ {symbol}: "
-                    f"qty={filled_qty:.4f} TP1={tp1_price:.8g} "
-                    f"SL={approx_sl:.8g} (برمجائي)"
+                    f"[Restore] ✅ {symbol} [{source}]: "
+                    f"entry={entry_price:.6g} SL={stop_loss:.6g} (-{sl_pct:.1f}%) "
+                    f"≈${asset_value:.1f} | {tp_status}{blacklisted_note}"
                 )
 
             _log(f"[Restore] اكتمل — {restored} صفقة مُستردة")
