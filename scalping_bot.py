@@ -50,7 +50,7 @@ class Config:
     scan_interval:      int   = field(default_factory=lambda: int(os.environ.get("SCAN_INTERVAL_MINUTES", "60")))
     rsi_threshold:      int   = field(default_factory=lambda: int(os.environ.get("RSI_OVERSOLD_THRESHOLD", "31")))
     min_volume_usd:     float = field(default_factory=lambda: float(os.environ.get("MIN_DAILY_VOLUME_USD", "1000000")))
-    cmc_top_rank:       int   = field(default_factory=lambda: int(os.environ.get("CMC_TOP_RANK", "300")))
+    cmc_top_rank:       int   = field(default_factory=lambda: int(os.environ.get("CMC_TOP_RANK", "500")))
     monitor_interval:   int   = 30
     max_ai_tokens:      int   = 150
     deepseek_model:     str   = field(default_factory=lambda: os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"))
@@ -61,6 +61,25 @@ class Config:
     sl_retry_attempts:        int   = 3
     disable_timeout_liquidation: bool = True  # Positions run until TP or Shadow SL — no time-based liquidation
     shariah_filter_enabled: bool = field(default_factory=lambda: os.environ.get("SHARIAH_FILTER_ENABLED", "true").lower() == "true")
+
+    # ── استراتيجية التشبع البيعي (S1) ──
+    s1_btc_rsi_min:     float = field(default_factory=lambda: float(os.environ.get("S1_BTC_RSI_MIN", "45")))
+    s1_rsi_extreme:     float = field(default_factory=lambda: float(os.environ.get("S1_RSI_EXTREME", "22")))   # يتجاوز شرط القاعدة
+    s1_sl_min:          float = field(default_factory=lambda: float(os.environ.get("S1_SL_MIN_PCT", "3")))     # % أضيق SL
+    s1_sl_max:          float = field(default_factory=lambda: float(os.environ.get("S1_SL_MAX_PCT", "5")))     # % أوسع SL
+    s1_tp1_floor:       float = field(default_factory=lambda: float(os.environ.get("S1_TP1_FLOOR_PCT", "5")))  # حد أدنى TP1
+
+    # ── استراتيجية الزخم (S2) ──
+    s2_enabled:         bool  = field(default_factory=lambda: os.environ.get("S2_MOMENTUM_ENABLED", "true").lower() == "true")
+    s2_rsi_min:         float = field(default_factory=lambda: float(os.environ.get("S2_RSI_MIN", "50")))
+    s2_rsi_max:         float = field(default_factory=lambda: float(os.environ.get("S2_RSI_MAX", "65")))
+    s2_btc_rsi_min:     float = field(default_factory=lambda: float(os.environ.get("S2_BTC_RSI_MIN", "50")))
+    s2_vol_ratio_min:   float = field(default_factory=lambda: float(os.environ.get("S2_VOL_RATIO_MIN", "1.2")))
+    s2_breakout_margin: float = field(default_factory=lambda: float(os.environ.get("S2_BREAKOUT_MARGIN_PCT", "0.5")))
+    s2_sl_pct:          float = field(default_factory=lambda: float(os.environ.get("S2_SL_PCT", "2.5")))
+    s2_tp1_pct:         float = field(default_factory=lambda: float(os.environ.get("S2_TP1_PCT", "3")))
+    s2_tp2_pct:         float = field(default_factory=lambda: float(os.environ.get("S2_TP2_PCT", "6")))
+    s2_tp3_pct:         float = field(default_factory=lambda: float(os.environ.get("S2_TP3_PCT", "9")))
     blacklisted_assets: set   = field(default_factory=lambda: {
         # ── إقراض بفائدة (Lending/Interest protocols) ──
         "AAVE", "COMP", "MKR", "CRV", "LDO", "UNI", "SUSHI", "BAL",
@@ -873,10 +892,15 @@ class ConsensusCommittee:
         support = support or {"has_support": False, "touches": 0, "support_level": 0.0}
         whale_data = whale_data or {"whale_alert": "none", "transactions": 0}
 
+        support_score = support.get("score", 0) if isinstance(support, dict) else 0
+        support_label = (
+            "STRONG (3+ touches — high confluence)" if support.get("touches", 0) >= 3 and support.get("has_support")
+            else "MODERATE (2 touches — some confluence)" if support.get("has_support")
+            else "NONE DETECTED — proceed with extra caution, RSI must be very oversold"
+        )
         support_line = (
-            f"Horizontal Support: {support['touches']} historical touches near "
-            f"{support['support_level']:.8g} — "
-            f"{'CONFIRMED (strong confluence)' if support['has_support'] else 'none detected'}"
+            f"Horizontal Support Score: {support_label} "
+            f"| touches={support.get('touches',0)} near {support.get('support_level',0):.8g}"
         )
 
         ds_msg = (
@@ -1204,7 +1228,7 @@ class HighSpeedExecutor:
         # ── Enforce minimum +5% floor on TP1 BEFORE placing the order ──
         # (سابقاً كان الأمر الفعلي على المنصة يُنفَّذ بـ tp1 الأصلي
         # قبل رفعه، فيُمكن أن يُنفَّذ بسعر أقل من +5% المقصود فعلياً)
-        effective_tp1 = max(tp1, entry_price * 1.05)
+        effective_tp1 = max(tp1, entry_price * (1 + self.cfg.s1_tp1_floor / 100))
         if effective_tp1 != tp1:
             _log(f"[Hybrid] {symbol}: TP1 lifted from {tp1:.8g} → {effective_tp1:.8g} (floor +5%)")
 
@@ -2098,20 +2122,28 @@ class ScalpingOrchestrator:
         btc_rsi = await asyncio.get_running_loop().run_in_executor(
             None, self._get_btc_rsi
         )
-        if btc_rsi < 45:
-            _log(f"[BTC Filter ❌] {symbol}: BTC RSI={btc_rsi:.1f} < 45 — سوق هابط عام، تجاهل")
+        if btc_rsi < self.cfg.s1_btc_rsi_min:
+            _log(f"[BTC Filter ❌] {symbol}: BTC RSI={btc_rsi:.1f} < {self.cfg.s1_btc_rsi_min} — سوق هابط عام")
             return
         _log(f"[BTC Filter ✅] {symbol}: BTC RSI={btc_rsi:.1f}")
 
-        # ── فلتر القاعدة السعرية: رفض السكاكين الساقطة ──
+        # ── Support Filter: وزن لا رفض ──
+        # القاعدة السعرية تُحسن جودة الإشارة لكن لا تمنع الصفقة كلياً
+        # RSI < 22 (تشبع بيعي شديد جداً) يتجاوز شرط القاعدة
         support_data = ind.get("support", {"has_support": False, "touches": 0, "support_level": 0.0})
         rsi_1d = ind.get("rsi_1d", ind["rsi"])
-        if not support_data["has_support"] and rsi_1d > 22:
-            # RSI بين 22-30 بدون قاعدة سعرية = انهيار مستمر محتمل
-            _log(f"[Support Filter ❌] {symbol}: RSI_1D={rsi_1d:.1f} بدون قاعدة سعرية — خطر سكين ساقط")
-            return
+        support_score = 0  # 0=بدون دعم، 1=دعم ضعيف، 2=دعم قوي
         if support_data["has_support"]:
-            _log(f"[Support Filter ✅] {symbol}: قاعدة سعرية مؤكدة ({support_data['touches']} لمسات)")
+            support_score = 2 if support_data["touches"] >= 3 else 1
+            _log(f"[Support ✅] {symbol}: {support_data['touches']} لمسات — score={support_score}")
+        elif rsi_1d <= self.cfg.s1_rsi_extreme:
+            # تشبع بيعي شديد → نمرر حتى بدون قاعدة
+            support_score = 1
+            _log(f"[Support ⚡] {symbol}: RSI_1D={rsi_1d:.1f} ≤ {self.cfg.s1_rsi_extreme} شديد جداً — تجاوز شرط القاعدة")
+        else:
+            # بدون قاعدة ورسي معتدل → نمرر لكن نُخبر Committee
+            support_score = 0
+            _log(f"[Support ⚠️] {symbol}: بدون قاعدة سعرية — Committee سيحكم")
 
         # ── Layer 1: RSI + CMC + LunarCrush ──
         passed, reason = await self.pipeline.layer1_pass(session, symbol, ind["rsi"])
@@ -2127,6 +2159,8 @@ class ScalpingOrchestrator:
 
         # ── Layer 2: Consensus Committee (DeepSeek + Llama-3.3) ──
         support_data = ind.get("support", {"has_support": False, "touches": 0, "support_level": 0.0})
+        # إضافة support_score للـ support_data قبل تمريرها للـ committee
+        support_data["score"] = support_score
         result = await self.committee.run(
             symbol        = symbol,
             rsi           = ind["rsi"],
@@ -2160,10 +2194,14 @@ class ScalpingOrchestrator:
             return
 
         targets   = result["targets"]
-        stop_loss = await asyncio.get_running_loop().run_in_executor(
+        raw_sl    = await asyncio.get_running_loop().run_in_executor(
             None, calculate_micro_swing_sl,
             self.executor.exchange, symbol, ind["current"]
         )
+        # تطبيق نطاق SL من متغيرات Railway
+        sl_min = ind["current"] * (1 - self.cfg.s1_sl_max / 100)  # -s1_sl_max%
+        sl_max = ind["current"] * (1 - self.cfg.s1_sl_min / 100)  # -s1_sl_min%
+        stop_loss = max(sl_min, min(raw_sl, sl_max))
 
         _log(
             f"[L2 ✅] {symbol} ({result['elapsed']}s) | "
@@ -2477,10 +2515,256 @@ class ScalpingOrchestrator:
         else:
             _log("[API Health] ✅ كل الأدوات تعمل بشكل طبيعي")
 
+
+    # ─────────────────────────────────────────────────────────
+    # استراتيجية الزخم — RSI 50-65 مع كسر مستوى مقاومة
+    # تعمل بالتوازي مع استراتيجية التشبع البيعي في نفس الـ slots
+    # ─────────────────────────────────────────────────────────
+
+    def _fetch_indicators_momentum(self, symbol: str) -> Optional[dict]:
+        """
+        يفحص إشارات الزخم الصاعد على فريم 4H:
+        - RSI بين 50-65: في منطقة صعود لكن لم يتشبع شراءً بعد
+        - السعر فوق MA20 (الزخم الإيجابي)
+        - حجم تداول متزايد (تأكيد الحركة)
+        - كسر مستوى مقاومة أفقي سابق
+        """
+        try:
+            ohlcv = self.executor.exchange.fetch_ohlcv(symbol, timeframe="4h", limit=80)
+            if not ohlcv or len(ohlcv) < 30:
+                return None
+
+            df     = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"]).astype(float)
+            closes = df["close"]
+            highs  = df["high"]
+            vols   = df["vol"]
+            current = float(closes.iloc[-1])
+
+            rsi = self._calc_rsi(closes, period=14)
+
+            # شرط RSI: بين 50-65 (زخم صاعد، ليس مفرط الشراء)
+            if not (self.cfg.s2_rsi_min <= rsi <= self.cfg.s2_rsi_max):
+                return None
+
+            # MA20: السعر فوقها → زخم إيجابي
+            ma20 = float(closes.tail(20).mean())
+            if current < ma20 * 0.99:  # هامش 1%
+                return None
+
+            # حجم متزايد: آخر شمعة فوق متوسط الـ 20
+            avg_vol = float(vols.tail(20).mean())
+            vol_ratio = float(vols.iloc[-1]) / avg_vol if avg_vol > 0 else 1.0
+            if vol_ratio < self.cfg.s2_vol_ratio_min:
+                return None
+
+            # كسر مقاومة: السعر الحالي أعلى من أعلى نقطة في آخر 20 شمعة (عدا آخر 3)
+            recent_high = float(highs.iloc[-23:-3].max())
+            breakout = current > recent_high * (1 + self.cfg.s2_breakout_margin / 100)
+
+            if not breakout:
+                return None
+
+            # أهداف Fibonacci للزخم (أصغر من التشبع البيعي)
+            fib_high = float(highs.tail(40).max())
+            fib_low  = float(df["low"].tail(40).min())
+
+            # حجم تداول
+            vol_usd = 0.0
+            try:
+                t = self.executor.exchange.fetch_ticker(symbol)
+                vol_usd = float(t.get("quoteVolume") or 0)
+            except Exception:
+                pass
+
+            return {
+                "current":   current,
+                "rsi":       rsi,
+                "rsi_1d":    rsi,
+                "rsi_4h":    rsi,
+                "rsi_note":  f"momentum⚡ RSI={rsi:.0f} [{self.cfg.s2_rsi_min:.0f}-{self.cfg.s2_rsi_max:.0f}] vol×{vol_ratio:.1f}",
+                "fib_high":  fib_high,
+                "fib_low":   fib_low,
+                "vol_usd":   vol_usd,
+                "support":   {"has_support": True, "touches": 2, "support_level": recent_high, "score": 2},
+                "strategy":  "momentum",
+                "breakout_level": recent_high,
+                "vol_ratio": vol_ratio,
+                "ma20":      ma20,
+            }
+        except Exception as e:
+            _log(f"[Momentum] ❌ {symbol}: {str(e)[:60]}")
+            return None
+
+    async def _process_momentum_candidate(
+        self,
+        session:         aiohttp.ClientSession,
+        symbol:          str,
+        initial_balance: float = 0.0,
+    ):
+        """
+        يعالج مرشحات استراتيجية الزخم — مسار مستقل عن التشبع البيعي.
+        أهداف أصغر لكن نسبة نجاح أعلى.
+        كل المعاملات قابلة للتعديل من Railway.
+        """
+        # فحص تفعيل الاستراتيجية من Railway
+        if not self.cfg.s2_enabled:
+            return
+
+        with self._processing_lock:
+            if symbol in self._processing_symbols:
+                return
+            if not self.slots.is_vacant(symbol):
+                return
+            self._processing_symbols.add(symbol)
+
+        try:
+            ind = await asyncio.get_running_loop().run_in_executor(
+                None, self._fetch_indicators_momentum, symbol
+            )
+            if not ind:
+                return
+
+            _log(f"[Momentum ⚡] {symbol}: {ind['rsi_note']} breakout={ind['breakout_level']:.6g}")
+
+            # فلتر BTC: في استراتيجية الزخم نشترط BTC RSI > 50 (أقوى)
+            btc_rsi = await asyncio.get_running_loop().run_in_executor(
+                None, self._get_btc_rsi
+            )
+            if btc_rsi < self.cfg.s2_btc_rsi_min:
+                _log(f"[Momentum BTC ❌] {symbol}: BTC RSI={btc_rsi:.1f} < {self.cfg.s2_btc_rsi_min}")
+                return
+
+            # فلتر CMC
+            async with aiohttp.ClientSession() as s:
+                cmc = await self.pipeline.get_cmc_data(s, symbol)
+            if not cmc.get("valid"):
+                return
+            if cmc["volume_24h"] < self.cfg.min_volume_usd:
+                return
+            if cmc["rank"] > self.cfg.cmc_top_rank:
+                return
+
+            # Shariah filter
+            base = symbol.split("/")[0].upper()
+            if self.cfg.shariah_filter_enabled and base in self.cfg.blacklisted_assets:
+                return
+
+            # Committee بـ prompt مخصص للزخم
+            lunar_data    = {"galaxy_score": 50, "social_volume": 0, "vote": "neutral"}
+            rss_sentiment = "neutral"
+            whale_data    = {"whale_alert": "none", "transactions": 0}
+
+            try:
+                async with aiohttp.ClientSession() as s:
+                    lunar_data    = await self.pipeline.get_lunar_score(s, symbol)
+                    rss_sentiment = await self.pipeline.get_rss_sentiment(s)
+                    whale_data    = await self.pipeline.get_whale_activity(s, symbol)
+            except Exception:
+                pass
+
+            result = await self.committee.run(
+                symbol        = symbol,
+                rsi           = ind["rsi"],
+                vol_m         = ind["vol_usd"] / 1e6,
+                entry         = ind["current"],
+                fib_high      = ind["fib_high"],
+                fib_low       = ind["fib_low"],
+                rss_sentiment = rss_sentiment,
+                lunar_data    = lunar_data,
+                support       = ind["support"],
+                whale_data    = whale_data,
+            )
+
+            if not result["approved"]:
+                _log(f"[Momentum L2 ❌] {symbol}: DS={result['ds_vote']} Llama={result['llama_vote']}")
+                return
+
+            # SL وTP من متغيرات Railway
+            entry_price = ind["current"]
+            try:
+                raw_sl    = calculate_micro_swing_sl(self.executor.exchange, symbol, entry_price)
+                sl_target = entry_price * (1 - self.cfg.s2_sl_pct / 100)
+                stop_loss = max(sl_target * 0.995, min(raw_sl, sl_target * 1.005))
+            except Exception:
+                stop_loss = entry_price * (1 - self.cfg.s2_sl_pct / 100)
+
+            targets = {
+                "tp1": entry_price * (1 + self.cfg.s2_tp1_pct / 100),
+                "tp2": entry_price * (1 + self.cfg.s2_tp2_pct / 100),
+                "tp3": entry_price * (1 + self.cfg.s2_tp3_pct / 100),
+            }
+
+            if not self.slots.is_vacant(symbol):
+                return
+
+            # Balance Guard
+            try:
+                bal = self.executor.exchange.fetch_balance({"type": "spot"})
+                free_usdt = float(bal.get("USDT", {}).get("free", 0) or bal.get("free", {}).get("USDT", 0))
+                if free_usdt < self.cfg.capital:
+                    return
+                existing_qty = float(bal.get(base, {}).get("total", 0) or bal.get("total", {}).get(base, 0) or 0)
+                if existing_qty * entry_price > 1.0:
+                    return
+            except Exception:
+                return
+
+            state = await asyncio.get_running_loop().run_in_executor(
+                None, self.executor.execute_full_trade,
+                symbol, entry_price,
+                targets["tp1"], targets["tp2"], targets["tp3"], stop_loss,
+            )
+
+            if not state:
+                return
+
+            self.slots.occupy(state)
+
+            # تسجيل في Supabase
+            trade_id = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: self.db.insert_trade(
+                    state             = state,
+                    capital           = self.cfg.capital,
+                    ds_vote           = result["ds_vote"],
+                    llama_vote        = result["llama_vote"],
+                    rss_sentiment     = rss_sentiment,
+                    galaxy_score      = float(lunar_data.get("galaxy_score", 0)),
+                    committee_summary = f"Momentum⚡ RSI={ind['rsi']:.0f} breakout={ind['breakout_level']:.6g} vol×{ind['vol_ratio']:.1f}",
+                )
+            )
+            if trade_id:
+                self.slots.update_state(symbol, db_trade_id=trade_id)
+
+            tp1_pct = (state.tp1 / state.entry_price - 1) * 100
+            tp2_pct = (state.tp2 / state.entry_price - 1) * 100
+            tp3_pct = (state.tp3 / state.entry_price - 1) * 100
+            sl_pct  = (1 - state.stop_loss / state.entry_price) * 100
+
+            await self._send_telegram(
+                "⚡ <b>صفقة زخم جديدة — Momentum</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📌 <b>العملة:</b> <code>{symbol}</code>\n"
+                f"💰 <b>رأس المال:</b> <code>${self.cfg.capital:.2f}</code>\n"
+                f"📈 <b>سعر الدخول:</b> <code>{state.entry_price:.8g}</code>\n"
+                f"📊 <b>RSI 4H:</b> <code>{ind['rsi']:.1f}</code> | حجم ×{ind['vol_ratio']:.1f}\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "🎯 <b>خطة الخروج (أهداف مضغوطة)</b>\n"
+                f"TP1 (+{tp1_pct:.1f}%): <code>{state.tp1:.8g}</code>\n"
+                f"TP2 (+{tp2_pct:.1f}%): <code>{state.tp2:.8g}</code>\n"
+                f"TP3 (+{tp3_pct:.1f}%): <code>{state.tp3:.8g}</code>\n"
+                f"🛡 SL (-{sl_pct:.1f}%): <code>{state.stop_loss:.8g}</code>\n"
+            )
+
+        finally:
+            with self._processing_lock:
+                self._processing_symbols.discard(symbol)
+
     async def scan_loop(self):
         await self._send_telegram(
             f"🤖 <b>Scalping Engine v3 نشط</b> | فلتر الشريعة: {'✅ مفعّل' if self.cfg.shariah_filter_enabled else '⏸ موقوف مؤقتاً'}\n"
-            f"🛡️ L1: RSI ≤ {self.cfg.rsi_threshold} (1D+4H) + CMC Top {self.cfg.cmc_top_rank} + BTC Filter\n"
+            f"🛡️ S1 (تشبع): RSI≤{self.cfg.rsi_threshold} | SL -{self.cfg.s1_sl_min}%~-{self.cfg.s1_sl_max}% | BTC≥{self.cfg.s1_btc_rsi_min:.0f}\n"
+            f"⚡ S2 (زخم): {'✅' if self.cfg.s2_enabled else '⏸'} RSI {self.cfg.s2_rsi_min:.0f}-{self.cfg.s2_rsi_max:.0f} | TP +{self.cfg.s2_tp1_pct:.0f}%/+{self.cfg.s2_tp2_pct:.0f}%/+{self.cfg.s2_tp3_pct:.0f}% | BTC≥{self.cfg.s2_btc_rsi_min:.0f}\n"
             f"📍 L1+: فلتر القاعدة السعرية (≥2 لمسات تاريخية مطلوبة)\n"
             f"🧠 L2: DeepSeek (dual-TF) + Llama-3.3 (إجماع مطلوب)\n"
             f"⚡ L3: MARKET buy | TP1=40% TP2=35% TP3=25% | SL=-3% to -5%\n"
@@ -2550,11 +2834,14 @@ class ScalpingOrchestrator:
                     BATCH = 5
                     async with aiohttp.ClientSession() as session:
                         for i in range(0, len(symbols), BATCH):
-                            batch   = symbols[i:i+BATCH]
-                            tasks   = [
-                                self._process_candidate(session, sym, initial_balance)
-                                for sym in batch
-                            ]
+                            batch = symbols[i:i+BATCH]
+                            # ── الاستراتيجيتان بالتوازي في كل batch ──
+                            tasks = []
+                            for sym in batch:
+                                # استراتيجية 1: التشبع البيعي (RSI ≤ 30)
+                                tasks.append(self._process_candidate(session, sym, initial_balance))
+                                # استراتيجية 2: الزخم (RSI 50-65 + breakout) — slots مشتركة
+                                tasks.append(self._process_momentum_candidate(session, sym, initial_balance))
                             await asyncio.gather(*tasks, return_exceptions=True)
                             checked = i + len(batch)
                             if checked % 50 == 0:
