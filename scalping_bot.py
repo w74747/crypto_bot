@@ -44,6 +44,7 @@ class Config:
     lunar_api_key:      str   = field(default_factory=lambda: os.environ.get("LUNARCRUSH_API_KEY", ""))
     whale_alert_api_key: str  = field(default_factory=lambda: os.environ.get("WHALE_ALERT_API_KEY", ""))
     database_url:       str   = field(default_factory=lambda: os.environ.get("DATABASE_URL", ""))
+    fallback_db_url:    str   = field(default_factory=lambda: os.environ.get("FALLBACK_DATABASE_URL", ""))
 
     capital:            float = field(default_factory=lambda: float(os.environ.get("TRADE_INVESTMENT_AMOUNT", "30")))
     max_slots:          int   = field(default_factory=lambda: int(os.environ.get("MAX_CONCURRENT_TRADES", "3")))
@@ -116,22 +117,63 @@ def _format_duration(start_time: float) -> str:
 # ─────────────────────────────────────────────
 class TradeLogger:
     """
-    يسجّل كل صفقة في Supabase:
-    - يُنشئ سجلاً عند الشراء
-    - يُحدّثه عند كل خروج (TP1/TP2/TP3/SL)
-    - يوفر إجمالي أرباح الشهر الحالي
+    يسجّل كل صفقة في قاعدة البيانات مع دعم Fallback تلقائي:
+    - PRIMARY: DATABASE_URL (Supabase أو أي PostgreSQL)
+    - FALLBACK: FALLBACK_DATABASE_URL (Neon أو Railway PostgreSQL)
+    عند فشل Primary يتحول تلقائياً للـ Fallback بدون توقف.
     """
 
-    def __init__(self, database_url: str):
-        self.db_url   = database_url
-        self._enabled = bool(database_url and _PSYCOPG2_OK)
-        if self._enabled:
-            _log("[DB] ✅ TradeLogger متصل بـ Supabase")
-        else:
-            _log("[DB] ⚠️ TradeLogger معطّل (لا DATABASE_URL أو psycopg2)")
+    def __init__(self, database_url: str, fallback_db_url: str = ""):
+        self.db_url          = database_url
+        self.fallback_db_url = fallback_db_url
+        self._primary_ok     = False
+        self._fallback_ok    = False
+
+        # فحص Primary
+        if database_url and _PSYCOPG2_OK:
+            try:
+                conn = psycopg2.connect(database_url, sslmode="require", connect_timeout=5)
+                conn.close()
+                self._primary_ok = True
+                _log("[DB] ✅ Primary DB متصل (Supabase/PostgreSQL)")
+            except Exception as e:
+                _log(f"[DB] ⚠️ Primary DB فشل: {str(e)[:60]}")
+
+        # فحص Fallback
+        if fallback_db_url and _PSYCOPG2_OK:
+            try:
+                conn = psycopg2.connect(fallback_db_url, sslmode="require", connect_timeout=5)
+                conn.close()
+                self._fallback_ok = True
+                _log("[DB] ✅ Fallback DB متصل (Neon/Railway)")
+            except Exception as e:
+                _log(f"[DB] ⚠️ Fallback DB فشل: {str(e)[:60]}")
+
+        self._enabled = self._primary_ok or self._fallback_ok
+
+        if not self._enabled:
+            _log("[DB] ❌ كلا قاعدتي البيانات غير متاحتين — التسجيل معطّل")
 
     def _get_conn(self):
-        return psycopg2.connect(self.db_url, sslmode="require")
+        """يحاول Primary أولاً ثم Fallback تلقائياً."""
+        if self._primary_ok and self.db_url:
+            try:
+                return psycopg2.connect(self.db_url, sslmode="require", connect_timeout=5)
+            except Exception as e:
+                _log(f"[DB] Primary فشل، تحويل للـ Fallback: {str(e)[:50]}")
+                self._primary_ok = False  # لا تعيد المحاولة في نفس الجلسة
+
+        if self.fallback_db_url:
+            try:
+                conn = psycopg2.connect(self.fallback_db_url, sslmode="require", connect_timeout=5)
+                if not self._fallback_ok:
+                    _log("[DB] ✅ Fallback DB نشط")
+                    self._fallback_ok = True
+                return conn
+            except Exception as e:
+                raise ConnectionError(f"كلا قاعدتي البيانات غير متاحتين: {e}")
+
+        raise ConnectionError("لا توجد قاعدة بيانات متاحة")
 
     def insert_trade(
         self,
@@ -1806,11 +1848,150 @@ class ScalpingOrchestrator:
         self.pipeline               = DataPipeline(cfg)
         self.committee              = ConsensusCommittee(cfg)
         self.executor               = HighSpeedExecutor(cfg)
-        self.db                     = TradeLogger(cfg.database_url)
+        self.db                     = TradeLogger(cfg.database_url, cfg.fallback_db_url)
         self.monitor                = TradeMonitor(cfg, self.executor, self.slots, self.db)
         self._processing_symbols:   set[str] = set()
         self._processing_lock:      threading.Lock = threading.Lock()
         self._last_api_health_alert: float = 0.0  # آخر وقت أُرسل فيه تنبيه API health
+
+
+    def _post_restore_health_check(self):
+        """
+        Post-Restore Health Check — يعمل بعد _restore_open_positions مباشرة.
+
+        يفحص كل صفقة مُستردة ويتحقق من:
+        1. العملة لا تزال موجودة على MEXC (لم تُحذف)
+        2. SL معقول — ليس أعلى من السعر الحالي (يمنع الإغلاق الفوري الوهمي)
+        3. TP1 لا يزال نشطاً على المنصة (وإلا Self-Healing سيعيده)
+        4. الكمية الفعلية تتطابق مع المسجّلة (تحقق من dust أو إغلاق جزئي)
+
+        لا يُعدّل الأهداف (TP) آلياً — يُرسل تقرير Telegram فقط لكل ما يحتاج انتباهاً.
+        SL الخاطئ (> سعر حالي) هو الاستثناء الوحيد الذي يُصحَّح آلياً.
+        """
+        states = self.slots.get_all_states()
+        if not states:
+            return
+
+        _log(f"[Health Check] 🔍 فحص {len(states)} صفقة مُستردة...")
+
+        alerts = []
+        auto_fixed = []
+
+        for state in states:
+            symbol = state.symbol
+            issues = []
+
+            # ── 1: فحص وجود العملة على MEXC ──
+            if symbol not in self.executor.exchange.markets:
+                alerts.append(f"🚫 <b>{symbol}</b>: محذوفة من MEXC (Delisted) — تحرير الـ slot")
+                self.slots.release(symbol)
+                continue
+
+            # ── 2: جلب السعر الحالي ──
+            try:
+                ticker    = self.executor.exchange.fetch_ticker(symbol)
+                curr_price = float(ticker.get("last") or ticker.get("close") or 0)
+            except Exception as e:
+                alerts.append(f"⚠️ <b>{symbol}</b>: فشل جلب السعر — {str(e)[:40]}")
+                continue
+
+            if curr_price <= 0:
+                continue
+
+            # ── 3: فحص SL — الأخطر ──
+            sl = state.stop_loss
+            if sl <= 0:
+                issues.append("SL = 0 (غير مُعيَّن)")
+            elif sl >= curr_price * 0.99:
+                # SL أعلى من السعر الحالي → سيُغلق الصفقة فوراً بخسارة وهمية
+                old_sl = sl
+                new_sl = curr_price * 0.94  # -6% آمن
+                self.slots.update_state(symbol, stop_loss=new_sl)
+                auto_fixed.append(
+                    f"🔧 <b>{symbol}</b>: SL={old_sl:.6g} > سعر={curr_price:.6g} "
+                    f"→ صُحِّح تلقائياً إلى {new_sl:.6g} (-6%)"
+                )
+            elif sl < curr_price * 0.85:
+                # SL بعيد جداً (أكثر من -15%) — تنبيه فقط، لا تعديل
+                sl_pct = (1 - sl / curr_price) * 100
+                issues.append(f"SL بعيد جداً (-{sl_pct:.1f}%) — قد تكون الخسارة كبيرة")
+
+            # ── 4: فحص TP1 على المنصة (إذا لم يكتمل بعد) ──
+            if not state.tp1_filled:
+                if not state.tp1_order_id:
+                    issues.append("TP1 order ID مفقود — Self-Healing سيعيده في الدورة القادمة")
+                else:
+                    try:
+                        open_orders = self.executor.exchange.fetch_open_orders(symbol)
+                        open_ids = {str(o["id"]) for o in open_orders}
+                        if state.tp1_order_id not in open_ids:
+                            issues.append("TP1 غير موجود على المنصة — Self-Healing سيعيده")
+                    except Exception:
+                        pass  # فشل الفحص لا يعني وجود مشكلة
+
+            # ── 5: فحص الكمية الفعلية ──
+            try:
+                base_asset = symbol.split("/")[0]
+                bal        = self.executor.exchange.fetch_balance({"type": "spot"})
+                real_qty   = float(
+                    bal.get(base_asset, {}).get("total", 0) or
+                    bal.get("total", {}).get(base_asset, 0) or 0
+                )
+                if real_qty <= 0:
+                    issues.append(f"⚠️ لا يوجد رصيد فعلي على MEXC — قد تكون الصفقة مُغلقة")
+                elif abs(real_qty - state.filled_qty) / state.filled_qty > 0.15:
+                    issues.append(
+                        f"فرق كمية: مسجّل={state.filled_qty:.4f} فعلي={real_qty:.4f} "
+                        f"({abs(real_qty-state.filled_qty)/state.filled_qty*100:.0f}% فرق)"
+                    )
+            except Exception:
+                pass
+
+            # ── تجميع المشاكل ──
+            if issues:
+                entry_pct = (curr_price / state.entry_price - 1) * 100 if state.entry_price > 0 else 0
+                sign = "+" if entry_pct >= 0 else ""
+                issue_lines = "\n".join(f"   • {iss}" for iss in issues)
+                alerts.append(
+                    f"⚠️ <b>{symbol}</b> ({sign}{entry_pct:.1f}% من الدخول)\n{issue_lines}"
+                )
+            else:
+                _log(f"[Health Check] ✅ {symbol}: سعر={curr_price:.6g} SL={sl:.6g} — سليم")
+
+        # ── إرسال التقرير ──
+        if auto_fixed or alerts:
+            msg_parts = ["🔍 <b>Post-Restore Health Check</b>\n━━━━━━━━━━━━━━━━━━━━\n"]
+
+            if auto_fixed:
+                msg_parts.append("🔧 <b>تصحيحات تلقائية:</b>")
+                msg_parts.extend(auto_fixed)
+                msg_parts.append("")
+
+            if alerts:
+                msg_parts.append("⚠️ <b>تحتاج مراجعة:</b>")
+                msg_parts.extend(alerts)
+                msg_parts.append("")
+
+            msg_parts.append(f"<i>فُحصت {len(states)} صفقة | {len(auto_fixed)} تصحيح تلقائي | {len(alerts)} تنبيه</i>")
+
+            # إرسال متزامن (نحن في __init__ قبل asyncio loop)
+            import urllib.request, json as _json
+            try:
+                payload = _json.dumps({
+                    "chat_id": self.cfg.telegram_chat_id,
+                    "text": MEXC_HEADER + "\n".join(msg_parts),
+                    "parse_mode": "HTML"
+                }).encode()
+                req = urllib.request.Request(
+                    f"https://api.telegram.org/bot{self.cfg.telegram_token}/sendMessage",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                urllib.request.urlopen(req, timeout=10)
+            except Exception as e:
+                _log(f"[Health Check] Telegram error: {e}")
+        else:
+            _log(f"[Health Check] ✅ كل الصفقات سليمة — لا تنبيهات")
 
     def _restore_open_positions(self):
         """
@@ -2503,7 +2684,7 @@ class ScalpingOrchestrator:
                 msg = (
                     "🔧 <b>تنبيه: أدوات متوقفة أو غير متاحة</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━\n\n"
-                    + "\n".join(f"• {i}" for i in issues)
+                    + "\n".join(f"   • {i}" for i in issues)
                     + "\n\n<i>راجع مفاتيح API في Railway وتأكد من الرصيد المتاح.</i>"
                 )
                 await self._send_telegram(msg)
@@ -2760,6 +2941,181 @@ class ScalpingOrchestrator:
             with self._processing_lock:
                 self._processing_symbols.discard(symbol)
 
+
+    def _reassess_restored_positions(self):
+        """
+        إعادة تقييم الصفقات المُستردة بـ Fallback — يعمل مرة واحدة عند Restart.
+
+        المنطق:
+        - إذا كان السعر الحالي قريباً من TP1 (أقل من 15% بعيد) → استمر كما هو
+        - إذا كان TP1 بعيداً جداً (> 15%) → أعد حساب أقرب هدف واقعي:
+            * إذا كان RSI بدأ يرتد (> 35) → TP جديد عند +5% من الحالي
+            * إذا كان RSI لا يزال منخفضاً (≤ 35) → انتظر قليلاً (ربما ارتداد قادم)
+            * إذا كانت الخسارة > 30% من سعر الدخول المقدَّر → أغلق فوراً بـ market sell
+
+        لا يُغلق الصفقة بخسارة إلا إذا كانت الخسارة كبيرة جداً وبلا أمل تقني.
+        """
+        states = self.slots.get_all_states()
+        if not states:
+            return
+
+        # نعمل فقط على الصفقات التي استُردت بـ Fallback (لا بيانات دقيقة)
+        fallback_states = [s for s in states if not s.db_trade_id]
+        if not fallback_states:
+            _log("[Reassess] ✅ كل الصفقات لها بيانات دقيقة — لا حاجة لإعادة تقييم")
+            return
+
+        _log(f"[Reassess] 🔍 إعادة تقييم {len(fallback_states)} صفقة Fallback...")
+        actions = []
+
+        for state in fallback_states:
+            symbol = state.symbol
+
+            # جلب السعر الحالي
+            try:
+                ticker     = self.executor.exchange.fetch_ticker(symbol)
+                curr_price = float(ticker.get("last") or ticker.get("close") or 0)
+            except Exception:
+                continue
+            if curr_price <= 0:
+                continue
+
+            # جلب RSI على 4H للتقييم
+            rsi_4h = 50.0
+            try:
+                ohlcv = self.executor.exchange.fetch_ohlcv(symbol, timeframe="4h", limit=20)
+                if ohlcv and len(ohlcv) >= 15:
+                    import pandas as pd
+                    df    = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"]).astype(float)
+                    delta = df["close"].diff()
+                    gain  = delta.clip(lower=0).rolling(14).mean()
+                    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+                    rs    = gain / loss.replace(0, 1e-9)
+                    rsi_4h = float((100 - 100 / (1 + rs)).iloc[-1])
+            except Exception:
+                pass
+
+            tp1 = state.tp1
+            if tp1 <= 0:
+                continue
+
+            # نسبة بُعد السعر الحالي عن TP1
+            dist_to_tp1_pct = (tp1 - curr_price) / curr_price * 100
+
+            # نسبة الخسارة من سعر الدخول المقدَّر
+            entry = state.entry_price
+            loss_pct = (entry - curr_price) / entry * 100 if entry > 0 else 0
+
+            _log(
+                f"[Reassess] {symbol}: curr={curr_price:.6g} "
+                f"TP1={tp1:.6g} (بُعد {dist_to_tp1_pct:.1f}%) "
+                f"RSI_4H={rsi_4h:.1f} خسارة={loss_pct:.1f}%"
+            )
+
+            # ── القرار ──
+
+            # الحالة 1: قريب من TP1 — استمر
+            if dist_to_tp1_pct <= 15:
+                _log(f"[Reassess] ✅ {symbol}: قريب من TP1 — استمر")
+                actions.append(f"✅ <b>{symbol}</b>: قريب من TP1 ({dist_to_tp1_pct:.1f}%) — استمر")
+                continue
+
+            # الحالة 2: خسارة > 30% — أغلق فوراً
+            if loss_pct > 30:
+                _log(f"[Reassess] 🔻 {symbol}: خسارة {loss_pct:.1f}% > 30% — إغلاق فوري")
+                try:
+                    self.executor.emergency_market_sell(symbol, state.filled_qty)
+                    self.slots.release(symbol)
+                    actions.append(
+                        f"🔻 <b>{symbol}</b>: خسارة {loss_pct:.1f}% تجاوزت 30% — "
+                        f"أُغلقت بـ market sell عند {curr_price:.6g}"
+                    )
+                except Exception as e:
+                    _log(f"[Reassess] ❌ فشل الإغلاق {symbol}: {e}")
+                continue
+
+            # الحالة 3: RSI ≤ 35 (ارتداد محتمل) — انتظر
+            if rsi_4h <= 35:
+                _log(f"[Reassess] ⏳ {symbol}: RSI={rsi_4h:.1f} ≤ 35 — ارتداد محتمل، انتظر")
+                actions.append(
+                    f"⏳ <b>{symbol}</b>: TP1 بعيد ({dist_to_tp1_pct:.1f}%) "
+                    f"لكن RSI={rsi_4h:.1f} يشير لارتداد محتمل — انتظر"
+                )
+                continue
+
+            # الحالة 4: RSI > 35 وTP1 بعيد جداً — أعد حساب هدف واقعي
+            # الهدف الجديد: +5% من السعر الحالي (هدف قابل للتحقيق قريباً)
+            new_tp = curr_price * 1.05
+            new_sl = curr_price * 0.96  # -4% من الحالي كحماية
+
+            # إلغاء TP1 القديم وإعادة وضع limit sell عند الهدف الجديد
+            try:
+                # إلغاء الأوامر المفتوحة
+                if state.tp1_order_id and not state.tp1_filled:
+                    try:
+                        self.executor.exchange.cancel_all_orders(symbol)
+                        _log(f"[Reassess] {symbol}: TP1 القديم أُلغي")
+                    except Exception:
+                        pass
+                    import time as _time
+                    _time.sleep(0.5)
+
+                # وضع limit sell جديد عند الهدف الواقعي
+                qty_tp1  = self.executor._apply_step_size(symbol, state.filled_qty * 0.40)
+                new_tp_p = float(self.executor.exchange.price_to_precision(symbol, new_tp))
+                o = self.executor.exchange.create_limit_sell_order(symbol, qty_tp1, new_tp_p)
+
+                # تحديث الـ slot
+                self.slots.update_state(
+                    symbol,
+                    tp1         = new_tp,
+                    tp2         = new_tp * 1.04,
+                    tp3         = new_tp * 1.08,
+                    stop_loss   = new_sl,
+                    tp1_order_id = o["id"],
+                    tp1_filled  = False,
+                )
+
+                tp1_pct = (new_tp / curr_price - 1) * 100
+                _log(
+                    f"[Reassess] ✅ {symbol}: هدف جديد "
+                    f"TP1={new_tp:.6g} (+{tp1_pct:.1f}%) "
+                    f"SL={new_sl:.6g} (-4%) ID:{o['id']}"
+                )
+                actions.append(
+                    f"🔄 <b>{symbol}</b>: أُعيد ضبط الأهداف\n"
+                    f"   TP1 القديم: {tp1:.6g} (بعيد {dist_to_tp1_pct:.1f}%)\n"
+                    f"   TP1 الجديد: {new_tp:.6g} (+{tp1_pct:.1f}% من الحالي)\n"
+                    f"   SL الجديد: {new_sl:.6g} (-4%)"
+                )
+            except Exception as e:
+                _log(f"[Reassess] ❌ {symbol}: فشل إعادة الضبط: {e}")
+                actions.append(f"❌ <b>{symbol}</b>: فشل إعادة ضبط الأهداف — {str(e)[:50]}")
+
+        # ── إرسال تقرير Telegram ──
+        if actions:
+            import urllib.request, json as _json
+            try:
+                msg = (
+                    "🔄 <b>إعادة تقييم الصفقات عند Restart</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    + "\n\n".join(actions)
+                )
+                payload = _json.dumps({
+                    "chat_id":    self.cfg.telegram_chat_id,
+                    "text":       MEXC_HEADER + msg,
+                    "parse_mode": "HTML"
+                }).encode()
+                req = urllib.request.Request(
+                    f"https://api.telegram.org/bot{self.cfg.telegram_token}/sendMessage",
+                    data=payload, headers={"Content-Type": "application/json"},
+                )
+                urllib.request.urlopen(req, timeout=10)
+            except Exception as e:
+                _log(f"[Reassess] Telegram error: {e}")
+
+        _log(f"[Reassess] اكتمل — {len(actions)} إجراء")
+
     async def scan_loop(self):
         await self._send_telegram(
             f"🤖 <b>Scalping Engine v3 نشط</b> | فلتر الشريعة: {'✅ مفعّل' if self.cfg.shariah_filter_enabled else '⏸ موقوف مؤقتاً'}\n"
@@ -2860,6 +3216,10 @@ class ScalpingOrchestrator:
     async def run(self):
         # استرداد الصفقات المفتوحة قبل بدء المراقبة
         self._restore_open_positions()
+        # فحص صحة الصفقات المُستردة وإرسال تقرير Telegram
+        self._post_restore_health_check()
+        # إعادة تقييم الصفقات Fallback وضبط أهداف واقعية
+        self._reassess_restored_positions()
         await asyncio.gather(self.scan_loop(), self.monitor.start())
 
 
