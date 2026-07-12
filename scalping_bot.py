@@ -60,6 +60,7 @@ class Config:
     reconcile_interval: int   = field(default_factory=lambda: int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "180")))
     sl_retry_attempts:        int   = 3
     disable_timeout_liquidation: bool = True  # Positions run until TP or Shadow SL — no time-based liquidation
+    shariah_filter_enabled: bool = field(default_factory=lambda: os.environ.get("SHARIAH_FILTER_ENABLED", "true").lower() == "true")
     blacklisted_assets: set   = field(default_factory=lambda: {
         # ── إقراض بفائدة (Lending/Interest protocols) ──
         "AAVE", "COMP", "MKR", "CRV", "LDO", "UNI", "SUSHI", "BAL",
@@ -2478,7 +2479,7 @@ class ScalpingOrchestrator:
 
     async def scan_loop(self):
         await self._send_telegram(
-            "🤖 <b>Scalping Engine v3 نشط</b>\n"
+            f"🤖 <b>Scalping Engine v3 نشط</b> | فلتر الشريعة: {'✅ مفعّل' if self.cfg.shariah_filter_enabled else '⏸ موقوف مؤقتاً'}\n"
             f"🛡️ L1: RSI ≤ {self.cfg.rsi_threshold} (1D+4H) + CMC Top {self.cfg.cmc_top_rank} + BTC Filter\n"
             f"📍 L1+: فلتر القاعدة السعرية (≥2 لمسات تاريخية مطلوبة)\n"
             f"🧠 L2: DeepSeek (dual-TF) + Llama-3.3 (إجماع مطلوب)\n"
@@ -2490,6 +2491,8 @@ class ScalpingOrchestrator:
         while True:
             start = datetime.now()
             _log(f"🔄 Scan: {start.strftime('%Y-%m-%d %H:%M:%S')}")
+            if not self.cfg.shariah_filter_enabled:
+                _log("[Shariah Filter] ⏸ موقوف مؤقتاً — SHARIAH_FILTER_ENABLED=false")
 
             # ── فحص صحة APIs في بداية كل دورة ──
             await self._check_api_health()
@@ -2536,7 +2539,7 @@ class ScalpingOrchestrator:
                         if ":" in s or "swap" in s.lower() or "future" in s.lower():
                             continue
                         base = s.split("/")[0].upper()
-                        if base in self.cfg.blacklisted_assets:
+                        if self.cfg.shariah_filter_enabled and base in self.cfg.blacklisted_assets:
                             continue
                         if any(s.endswith(p) for p in ["3L/USDT","3S/USDT","5L/USDT","5S/USDT","UP/USDT","DOWN/USDT","BULL/USDT","BEAR/USDT"]):
                             continue
