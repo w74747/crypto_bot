@@ -766,8 +766,9 @@ def calculate_micro_swing_sl(exchange, symbol: str, entry_price: float) -> float
         _log(f"[SL Calc] {symbol} fallback 6%: {e}")
         sl = entry_price * 0.94
 
-    # نطاق مرن: لا أقرب من -4%، لا أبعد من -8%
-    sl = max(entry_price * 0.92, min(sl, entry_price * 0.96))
+    # نطاق مُحسَّن: لا أقرب من -3%، لا أبعد من -5%
+    # ضيّقنا النطاق لتحسين R:R — SL أضيق = خسارة أصغر عند الفشل
+    sl = max(entry_price * 0.95, min(sl, entry_price * 0.97))
     return sl
 
 # ─────────────────────────────────────────────
@@ -782,9 +783,11 @@ class ConsensusCommittee:
     """
 
     DS_SYSTEM = (
-        "You are a crypto technical analyst. Evaluate the oversold setup strictly. "
-        "Primary signal: RSI < 30 (oversold). Secondary confirmation: price near or below lower Bollinger Band is a plus but not required. "
-        "If RSI is clearly oversold (below 25), lean BUY unless there is a strong reason not to. "
+        "You are a crypto technical analyst evaluating oversold bounce setups. "
+        "You receive dual-timeframe RSI data (1D and 4H) and horizontal support information. "
+        "BUY conditions: RSI oversold on BOTH timeframes (1D<30 AND 4H<35) is a strong signal. "
+        "A confirmed horizontal support level (2+ historical touches) is required unless RSI is extremely oversold (<22). "
+        "SKIP if: only one timeframe is oversold with no support, or if the pattern looks like a falling knife (no bounce attempts). "
         "Respond with exactly one word on the last line: BUY or SKIP."
     )
     LLAMA_SYSTEM = (
@@ -939,9 +942,12 @@ class ConsensusCommittee:
 # TP1 = 20% exchange limit (partial profit lock)
 # TP2 = 40% shadow (50% of remaining 80%)
 # TP3 = 40% shadow (remaining 100% of what's left)
-TP1_QTY_PCT = 0.20
-TP2_QTY_PCT = 0.40
-TP3_QTY_PCT = 0.40
+# توزيع الكمية المُحسَّن: TP1 أكبر لتأمين ربح فوري أسرع
+# R:R الجديد: TP1 (+5% × 40%) = $0.40 مقابل SL (-4%) = $0.82
+# تحسين من 1:6 إلى 1:2 تقريباً
+TP1_QTY_PCT = 0.40   # رُفع من 20% — يأمّن ربحاً فورياً أكبر
+TP2_QTY_PCT = 0.35   # حُرِّر جزء لـ TP1
+TP3_QTY_PCT = 0.25   # مكافأة إذا استمر الصعود
 
 
 class HighSpeedExecutor:
@@ -1044,9 +1050,9 @@ class HighSpeedExecutor:
         ids: dict = {}
 
         # Scaled exit: 20% TP1 on exchange, 40% TP2 shadow, 40% TP3 shadow (= 100% total)
-        qty_tp1 = self._apply_step_size(symbol, filled_qty * 0.20)
-        qty_tp2 = self._apply_step_size(symbol, filled_qty * 0.40)
-        qty_tp3 = self._apply_step_size(symbol, filled_qty * 0.40)
+        qty_tp1 = self._apply_step_size(symbol, filled_qty * 0.40)
+        qty_tp2 = self._apply_step_size(symbol, filled_qty * 0.35)
+        qty_tp3 = self._apply_step_size(symbol, filled_qty * 0.25)
         ids["qty_tp1"] = qty_tp1
         ids["qty_tp2"] = qty_tp2
         ids["qty_tp3"] = qty_tp3
@@ -1705,7 +1711,7 @@ class TradeMonitor:
         sl_pct  = (1 - state.stop_loss / entry) * 100 if entry > 0 else 0
 
         # تحديد نسبة الكمية المباعة
-        qty_pct_map = {"TP1": "20%", "TP2": "40%", "TP3": "الكل المتبقي", "SL": "الكل المتبقي"}
+        qty_pct_map = {"TP1": "40%", "TP2": "35%", "TP3": "الكل المتبقي", "SL": "الكل المتبقي"}
         qty_pct_str = qty_pct_map.get(exit_type, "—")
 
         # ── تسجيل الخروج في Supabase ──
@@ -1976,35 +1982,79 @@ class ScalpingOrchestrator:
         rs    = gain / loss.replace(0, 1e-9)
         return float((100 - 100 / (1 + rs)).iloc[-1])
 
-    def _fetch_indicators(self, symbol: str) -> Optional[dict]:
+    def _get_btc_rsi(self) -> float:
+        """
+        يجلب RSI البيتكوين على فريم 4H كمؤشر لاتجاه السوق العام.
+        إذا كان RSI البيتكوين < 45 (سوق هابط عام) نرفض الصفقة.
+        هذا يمنع الشراء في عملات صغيرة بينما البيتكوين ينهار.
+        """
         try:
+            ohlcv = self.executor.exchange.fetch_ohlcv("BTC/USDT", timeframe="4h", limit=50)
+            if not ohlcv or len(ohlcv) < 20:
+                return 50.0  # fail-safe: محايد
+            df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"]).astype(float)
+            return self._calc_rsi(df["close"])
+        except Exception:
+            return 50.0  # fail-safe: محايد
+
+    def _fetch_indicators(self, symbol: str) -> Optional[dict]:
+        """
+        يجمع إشارتين: فريم 1D للاتجاه الكبير + فريم 4H للتوقيت الدقيق.
+        الشرط: RSI مُتشبَّع بيعياً على كلا الفريمين أو على 4H مع تأكيد 1D.
+        هذا يحسن توقيت الدخول ويقلل الدخول في منتصف الانهيار.
+        """
+        try:
+            # ── فريم 1D: الاتجاه الكبير والـ Fibonacci ──
             try:
-                ohlcv = self.executor.exchange.fetch_ohlcv(symbol, timeframe="1d", limit=120)
+                ohlcv_1d = self.executor.exchange.fetch_ohlcv(symbol, timeframe="1d", limit=120)
             except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-                _log(f"[Scan] OHLCV fetch failed {symbol}: {type(e).__name__}")
+                _log(f"[Scan] OHLCV 1D fetch failed {symbol}: {type(e).__name__}")
                 return None
-            if not ohlcv or len(ohlcv) < 30:
+            if not ohlcv_1d or len(ohlcv_1d) < 30:
                 return None
-            df      = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"]).astype(float)
-            closes  = df["close"]
-            current = float(closes.iloc[-1])
-            rsi     = self._calc_rsi(closes)
-            fib_high = float(df["high"].tail(60).max())
-            fib_low  = float(df["low"].tail(60).min())
-            support  = detect_horizontal_support(df, current)
-            vol_usd  = 0.0
+
+            df_1d    = pd.DataFrame(ohlcv_1d, columns=["ts","open","high","low","close","vol"]).astype(float)
+            closes_1d = df_1d["close"]
+            current   = float(closes_1d.iloc[-1])
+            rsi_1d    = self._calc_rsi(closes_1d)
+            fib_high  = float(df_1d["high"].tail(60).max())
+            fib_low   = float(df_1d["low"].tail(60).min())
+            support   = detect_horizontal_support(df_1d, current)
+
+            # ── فريم 4H: توقيت الدخول الدقيق ──
+            rsi_4h = rsi_1d  # fallback
+            try:
+                ohlcv_4h = self.executor.exchange.fetch_ohlcv(symbol, timeframe="4h", limit=60)
+                if ohlcv_4h and len(ohlcv_4h) >= 20:
+                    df_4h  = pd.DataFrame(ohlcv_4h, columns=["ts","open","high","low","close","vol"]).astype(float)
+                    rsi_4h = self._calc_rsi(df_4h["close"])
+            except Exception:
+                pass
+
+            # ── RSI المُستخدَم للقرار: الأعلى من الاثنين (أكثر تحفظاً) ──
+            # إذا كلاهما مُتشبَّع بيعي → إشارة قوية جداً
+            # إذا واحد فقط → إشارة متوسطة، نأخذها لكن نسجلها
+            rsi_decision = max(rsi_1d, rsi_4h)
+            rsi_note = "dual✅" if (rsi_1d <= 32 and rsi_4h <= 35) else f"1D={rsi_1d:.0f}/4H={rsi_4h:.0f}"
+
+            vol_usd = 0.0
             try:
                 t       = self.executor.exchange.fetch_ticker(symbol)
                 vol_usd = float(t.get("quoteVolume") or 0)
-            except ccxt.NetworkError:
-                pass
-            except ccxt.ExchangeError:
-                pass
             except Exception:
                 pass
-            return {"current": current, "rsi": rsi,
-                    "fib_high": fib_high, "fib_low": fib_low, "vol_usd": vol_usd,
-                    "support": support}
+
+            return {
+                "current":  current,
+                "rsi":      rsi_decision,
+                "rsi_1d":   rsi_1d,
+                "rsi_4h":   rsi_4h,
+                "rsi_note": rsi_note,
+                "fib_high": fib_high,
+                "fib_low":  fib_low,
+                "vol_usd":  vol_usd,
+                "support":  support,
+            }
         except Exception as e:
             _log(f"[Scan] ❌ {symbol}: {type(e).__name__}: {str(e)[:80]}")
             return None
@@ -2040,7 +2090,27 @@ class ScalpingOrchestrator:
         if not ind:
             return
 
-        _log(f"[Scan] {symbol}: RSI={ind['rsi']:.1f} Vol=${ind['vol_usd']/1e6:.1f}M")
+        rsi_note = ind.get("rsi_note", "")
+        _log(f"[Scan] {symbol}: RSI={ind['rsi']:.1f} ({rsi_note}) Vol=${ind['vol_usd']/1e6:.1f}M")
+
+        # ── فلتر BTC: لا شراء إذا كان السوق العام في هبوط قوي ──
+        btc_rsi = await asyncio.get_running_loop().run_in_executor(
+            None, self._get_btc_rsi
+        )
+        if btc_rsi < 45:
+            _log(f"[BTC Filter ❌] {symbol}: BTC RSI={btc_rsi:.1f} < 45 — سوق هابط عام، تجاهل")
+            return
+        _log(f"[BTC Filter ✅] {symbol}: BTC RSI={btc_rsi:.1f}")
+
+        # ── فلتر القاعدة السعرية: رفض السكاكين الساقطة ──
+        support_data = ind.get("support", {"has_support": False, "touches": 0, "support_level": 0.0})
+        rsi_1d = ind.get("rsi_1d", ind["rsi"])
+        if not support_data["has_support"] and rsi_1d > 22:
+            # RSI بين 22-30 بدون قاعدة سعرية = انهيار مستمر محتمل
+            _log(f"[Support Filter ❌] {symbol}: RSI_1D={rsi_1d:.1f} بدون قاعدة سعرية — خطر سكين ساقط")
+            return
+        if support_data["has_support"]:
+            _log(f"[Support Filter ✅] {symbol}: قاعدة سعرية مؤكدة ({support_data['touches']} لمسات)")
 
         # ── Layer 1: RSI + CMC + LunarCrush ──
         passed, reason = await self.pipeline.layer1_pass(session, symbol, ind["rsi"])
@@ -2408,10 +2478,11 @@ class ScalpingOrchestrator:
 
     async def scan_loop(self):
         await self._send_telegram(
-            "🤖 <b>Scalping Engine نشط</b>\n"
-            f"🛡️ L1: RSI ≤ {self.cfg.rsi_threshold} + CMC Top {self.cfg.cmc_top_rank} + LunarCrush\n"
-            f"🧠 L2: DeepSeek + Llama-3.3 (إجماع مطلوب)\n"
-            f"⚡ L3: MARKET buy + TP1 Limit + SL Stop-Limit\n"
+            "🤖 <b>Scalping Engine v3 نشط</b>\n"
+            f"🛡️ L1: RSI ≤ {self.cfg.rsi_threshold} (1D+4H) + CMC Top {self.cfg.cmc_top_rank} + BTC Filter\n"
+            f"📍 L1+: فلتر القاعدة السعرية (≥2 لمسات تاريخية مطلوبة)\n"
+            f"🧠 L2: DeepSeek (dual-TF) + Llama-3.3 (إجماع مطلوب)\n"
+            f"⚡ L3: MARKET buy | TP1=40% TP2=35% TP3=25% | SL=-3% to -5%\n"
             f"• Slots: {self.cfg.max_slots} | Capital: ${self.cfg.capital}/trade\n"
             f"• Scan: كل {self.cfg.scan_interval} دقيقة"
         )
