@@ -64,11 +64,11 @@ class Config:
     shariah_filter_enabled: bool = field(default_factory=lambda: os.environ.get("SHARIAH_FILTER_ENABLED", "true").lower() == "true")
 
     # ── استراتيجية التشبع البيعي (S1) ──
-    s1_btc_rsi_min:     float = field(default_factory=lambda: float(os.environ.get("S1_BTC_RSI_MIN", "45")))
+    s1_btc_rsi_min:     float = field(default_factory=lambda: float(os.environ.get("S1_BTC_RSI_MIN", "40")))
     s1_rsi_extreme:     float = field(default_factory=lambda: float(os.environ.get("S1_RSI_EXTREME", "22")))   # يتجاوز شرط القاعدة
-    s1_sl_min:          float = field(default_factory=lambda: float(os.environ.get("S1_SL_MIN_PCT", "3")))     # % أضيق SL
-    s1_sl_max:          float = field(default_factory=lambda: float(os.environ.get("S1_SL_MAX_PCT", "5")))     # % أوسع SL
-    s1_tp1_floor:       float = field(default_factory=lambda: float(os.environ.get("S1_TP1_FLOOR_PCT", "5")))  # حد أدنى TP1
+    s1_sl_min:          float = field(default_factory=lambda: float(os.environ.get("S1_SL_MIN_PCT", "2")))     # % أضيق SL
+    s1_sl_max:          float = field(default_factory=lambda: float(os.environ.get("S1_SL_MAX_PCT", "3")))     # % أوسع SL
+    s1_tp1_floor:       float = field(default_factory=lambda: float(os.environ.get("S1_TP1_FLOOR_PCT", "6")))  # حد أدنى TP1
 
     # ── استراتيجية الزخم (S2) ──
     s2_enabled:         bool  = field(default_factory=lambda: os.environ.get("S2_MOMENTUM_ENABLED", "true").lower() == "true")
@@ -830,7 +830,7 @@ def calculate_micro_swing_sl(exchange, symbol: str, entry_price: float) -> float
 
     # نطاق مُحسَّن: لا أقرب من -3%، لا أبعد من -5%
     # ضيّقنا النطاق لتحسين R:R — SL أضيق = خسارة أصغر عند الفشل
-    sl = max(entry_price * 0.95, min(sl, entry_price * 0.97))
+    sl = max(entry_price * 0.97, min(sl, entry_price * 0.98))
     return sl
 
 # ─────────────────────────────────────────────
@@ -1009,12 +1009,14 @@ class ConsensusCommittee:
 # TP1 = 20% exchange limit (partial profit lock)
 # TP2 = 40% shadow (50% of remaining 80%)
 # TP3 = 40% shadow (remaining 100% of what's left)
-# توزيع الكمية المُحسَّن: TP1 أكبر لتأمين ربح فوري أسرع
-# R:R الجديد: TP1 (+5% × 40%) = $0.40 مقابل SL (-4%) = $0.82
-# تحسين من 1:6 إلى 1:2 تقريباً
-TP1_QTY_PCT = 0.40   # رُفع من 20% — يأمّن ربحاً فورياً أكبر
-TP2_QTY_PCT = 0.35   # حُرِّر جزء لـ TP1
-TP3_QTY_PCT = 0.25   # مكافأة إذا استمر الصعود
+# استراتيجية الهدف الواحد السريع:
+# TP1 = 80% عند +6% → ربح سريع ومضمون ($0.96 على $20)
+# TP2 = 20% عند +9% → مكافأة إذا استمر الصعود
+# SL  = -3%          → خسارة محدودة ($0.61 على $20)
+# R:R = 1:1.6 — الأفضل حتى الآن
+TP1_QTY_PCT = 0.80   # الجزء الأكبر يخرج سريعاً عند +6%
+TP2_QTY_PCT = 0.20   # الباقي ينتظر +9%
+TP3_QTY_PCT = 0.00   # غير مستخدم
 
 
 class HighSpeedExecutor:
@@ -1117,9 +1119,9 @@ class HighSpeedExecutor:
         ids: dict = {}
 
         # Scaled exit: 20% TP1 on exchange, 40% TP2 shadow, 40% TP3 shadow (= 100% total)
-        qty_tp1 = self._apply_step_size(symbol, filled_qty * 0.40)
-        qty_tp2 = self._apply_step_size(symbol, filled_qty * 0.35)
-        qty_tp3 = self._apply_step_size(symbol, filled_qty * 0.25)
+        qty_tp1 = self._apply_step_size(symbol, filled_qty * 0.80)
+        qty_tp2 = self._apply_step_size(symbol, filled_qty * 0.20)
+        qty_tp3 = self._apply_step_size(symbol, filled_qty * 0.00)
         ids["qty_tp1"] = qty_tp1
         ids["qty_tp2"] = qty_tp2
         ids["qty_tp3"] = qty_tp3
@@ -1778,7 +1780,7 @@ class TradeMonitor:
         sl_pct  = (1 - state.stop_loss / entry) * 100 if entry > 0 else 0
 
         # تحديد نسبة الكمية المباعة
-        qty_pct_map = {"TP1": "40%", "TP2": "35%", "TP3": "الكل المتبقي", "SL": "الكل المتبقي"}
+        qty_pct_map = {"TP1": "80%", "TP2": "20%", "TP3": "—", "SL": "الكل المتبقي"}
         qty_pct_str = qty_pct_map.get(exit_type, "—")
 
         # ── تسجيل الخروج في Supabase ──
@@ -3123,7 +3125,7 @@ class ScalpingOrchestrator:
             f"⚡ S2 (زخم): {'✅' if self.cfg.s2_enabled else '⏸'} RSI {self.cfg.s2_rsi_min:.0f}-{self.cfg.s2_rsi_max:.0f} | TP +{self.cfg.s2_tp1_pct:.0f}%/+{self.cfg.s2_tp2_pct:.0f}%/+{self.cfg.s2_tp3_pct:.0f}% | BTC≥{self.cfg.s2_btc_rsi_min:.0f}\n"
             f"📍 L1+: فلتر القاعدة السعرية (≥2 لمسات تاريخية مطلوبة)\n"
             f"🧠 L2: DeepSeek (dual-TF) + Llama-3.3 (إجماع مطلوب)\n"
-            f"⚡ L3: MARKET buy | TP1=40% TP2=35% TP3=25% | SL=-3% to -5%\n"
+            f"⚡ L3: MARKET buy | TP1=80%(+6%) TP2=20%(+9%) | SL=-2% to -3% | BTC≥{self.cfg.s1_btc_rsi_min:.0f}\n"
             f"• Slots: {self.cfg.max_slots} | Capital: ${self.cfg.capital}/trade\n"
             f"• Scan: كل {self.cfg.scan_interval} دقيقة"
         )
