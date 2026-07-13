@@ -2183,12 +2183,29 @@ class ScalpingOrchestrator:
         self.slots                  = SlotManager(cfg)
         self.pipeline               = DataPipeline(cfg)
         self.committee              = ConsensusCommittee(cfg)
+
+        # ── Executor الأساسي (Spot افتراضياً) ──
         self.executor               = HighSpeedExecutor(cfg)
+
+        # ── Futures Executor منفصل (يُنشأ فقط إذا MARKET_FUTURES=true) ──
+        self.futures_executor: Optional[HighSpeedExecutor] = None
+        if cfg.market_futures:
+            try:
+                # نُنشئ نسخة Config مؤقتة تجبر الـ executor على Futures mode
+                import copy
+                futures_cfg = copy.copy(cfg)
+                object.__setattr__(futures_cfg, "market_futures", True)
+                object.__setattr__(futures_cfg, "market_spot",    False)
+                self.futures_executor = HighSpeedExecutor(futures_cfg)
+                _log("✅ Futures Executor متصل — جاهز للتداول في Perpetual Swaps")
+            except Exception as e:
+                _log(f"⚠️ فشل إنشاء Futures Executor: {e} — سيعمل Spot فقط")
+
         self.db                     = TradeLogger(cfg.database_url, cfg.fallback_db_url)
         self.monitor                = TradeMonitor(cfg, self.executor, self.slots, self.db)
         self._processing_symbols:   set[str] = set()
         self._processing_lock:      threading.Lock = threading.Lock()
-        self._last_api_health_alert: float = 0.0  # آخر وقت أُرسل فيه تنبيه API health
+        self._last_api_health_alert: float = 0.0
 
 
 
@@ -3567,6 +3584,247 @@ class ScalpingOrchestrator:
 
         _log(f"[Reassess] اكتمل — {len(actions)} إجراء")
 
+
+    async def _process_futures_candidate(
+        self,
+        session:         aiohttp.ClientSession,
+        symbol:          str,
+        initial_balance: float = 0.0,
+    ):
+        """
+        مسار معالجة Futures — مستقل عن Spot.
+        يستخدم futures_executor المتصل بـ defaultType="swap".
+
+        الفلاتر:
+        - RSI ≤ 30 على 4H (أسرع من 1D لأن Futures يحتاج توقيتاً أدق)
+        - BTC RSI > s2_btc_rsi_min (أعلى من Spot لأن الرافعة تضخم المخاطر)
+        - CMC Top + Volume
+        - Committee موافقة
+
+        الأهداف: من FUTURES_TP1_PCT وFUTURES_TP2_PCT (أصغر من Spot)
+        SL: محسوب بأمان من Liquidation Price الفعلي
+        """
+        if not self.futures_executor:
+            return
+
+        with self._processing_lock:
+            if symbol in self._processing_symbols:
+                return
+            if not self.slots.is_vacant(symbol):
+                return
+            self._processing_symbols.add(symbol)
+
+        try:
+            # ── جلب مؤشرات Futures (4H أساساً) ──
+            ind = await asyncio.get_running_loop().run_in_executor(
+                None, self._fetch_indicators_futures, symbol
+            )
+            if not ind:
+                return
+
+            _log(f"[Futures Scan] {symbol}: RSI_4H={ind['rsi']:.1f} Vol=${ind['vol_usd']/1e6:.1f}M")
+
+            # ── فلتر BTC (أصعب من Spot) ──
+            btc_rsi = await asyncio.get_running_loop().run_in_executor(
+                None, self._get_btc_rsi
+            )
+            if btc_rsi < self.cfg.s2_btc_rsi_min:
+                _log(f"[Futures BTC ❌] {symbol}: BTC RSI={btc_rsi:.1f} < {self.cfg.s2_btc_rsi_min}")
+                return
+
+            # ── فلتر CMC ──
+            async with aiohttp.ClientSession() as s:
+                spot_symbol = symbol.replace(":USDT", "")
+                cmc = await self.pipeline.get_cmc_data(s, spot_symbol)
+            if not cmc.get("valid"):
+                return
+            if cmc["volume_24h"] < self.cfg.min_volume_usd * 2:  # حجم أعلى للـ Futures
+                return
+            if cmc["rank"] > self.cfg.cmc_top_rank:
+                return
+
+            # ── Shariah Filter ──
+            base = symbol.split("/")[0].upper()
+            if self.cfg.shariah_filter_enabled and base in self.cfg.blacklisted_assets:
+                return
+
+            # ── Committee ──
+            lunar_data    = {"galaxy_score": 50, "social_volume": 0, "vote": "neutral"}
+            rss_sentiment = "neutral"
+            whale_data    = {"whale_alert": "none", "transactions": 0}
+            try:
+                async with aiohttp.ClientSession() as s:
+                    lunar_data    = await self.pipeline.get_lunar_score(s, spot_symbol)
+                    rss_sentiment = await self.pipeline.get_rss_sentiment(s)
+                    whale_data    = await self.pipeline.get_whale_activity(s, spot_symbol)
+            except Exception:
+                pass
+
+            support_data = ind.get("support", {"has_support": False, "touches": 0, "support_level": 0.0, "score": 0})
+            result = await self.committee.run(
+                symbol        = spot_symbol,
+                rsi           = ind["rsi"],
+                vol_m         = ind["vol_usd"] / 1e6,
+                entry         = ind["current"],
+                fib_high      = ind["fib_high"],
+                fib_low       = ind["fib_low"],
+                rss_sentiment = rss_sentiment,
+                lunar_data    = lunar_data,
+                support       = support_data,
+                whale_data    = whale_data,
+            )
+
+            if not result["approved"]:
+                _log(f"[Futures L2 ❌] {symbol}: DS={result['ds_vote']} Llama={result['llama_vote']}")
+                return
+
+            if not self.slots.is_vacant(symbol):
+                return
+
+            # ── Balance Guard — Futures Wallet ──
+            try:
+                bal = self.futures_executor.exchange.fetch_balance({"type": "swap"})
+                free_usdt = float(
+                    bal.get("USDT", {}).get("free", 0) or
+                    bal.get("free", {}).get("USDT", 0)
+                )
+                if free_usdt < self.cfg.capital:
+                    _log(f"[Futures Balance] رصيد Futures غير كافٍ: ${free_usdt:.2f}")
+                    return
+            except Exception as e:
+                _log(f"[Futures Balance] {e}")
+                return
+
+            entry_price = ind["current"]
+
+            # ── حساب Liquidation وSL ──
+            liq_price = calculate_liquidation_price(
+                entry_price, self.cfg.futures_leverage, self.cfg.futures_margin_mode
+            )
+            stop_loss = calculate_safe_sl_futures(
+                entry_price, self.cfg.futures_leverage,
+                self.cfg.futures_sl_pct, liq_price, self.cfg.futures_liq_buffer
+            )
+            tp1 = entry_price * (1 + self.cfg.futures_tp1_pct / 100)
+            tp2 = entry_price * (1 + self.cfg.futures_tp2_pct / 100)
+            tp3 = tp2 * 1.02
+
+            # ── تنفيذ الصفقة عبر futures_executor ──
+            state = await asyncio.get_running_loop().run_in_executor(
+                None, self.futures_executor.execute_full_trade,
+                symbol, entry_price, tp1, tp2, tp3, stop_loss,
+            )
+
+            if not state:
+                _log(f"[Futures L3 ❌] {symbol}: تنفيذ فشل")
+                return
+
+            self.slots.occupy(state)
+
+            # تسجيل في DB
+            trade_id = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: self.db.insert_trade(
+                    state             = state,
+                    capital           = self.cfg.capital,
+                    ds_vote           = result["ds_vote"],
+                    llama_vote        = result["llama_vote"],
+                    rss_sentiment     = rss_sentiment,
+                    galaxy_score      = float(lunar_data.get("galaxy_score", 0)),
+                    committee_summary = (
+                        f"Futures⚡ RSI_4H={ind['rsi']:.0f} "
+                        f"Lev={self.cfg.futures_leverage}x "
+                        f"Liq={liq_price:.6g}"
+                    ),
+                )
+            )
+            if trade_id:
+                self.slots.update_state(symbol, db_trade_id=trade_id)
+
+            lev = self.cfg.futures_leverage
+            tp1_eff = (tp1 / entry_price - 1) * 100 * lev
+            sl_eff  = (1 - stop_loss / entry_price) * 100 * lev
+
+            await self._send_telegram(
+                "⚡ <b>صفقة Futures جديدة — Long</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📌 <b>العملة:</b> <code>{symbol}</code>\n"
+                f"💰 <b>رأس المال:</b> <code>${self.cfg.capital:.2f}</code> × {lev}x\n"
+                f"📈 <b>سعر الدخول:</b> <code>{entry_price:.8g}</code>\n"
+                f"📦 <b>الكمية:</b> <code>{state.filled_qty:.4f}</code>\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎯 TP1: <code>{tp1:.8g}</code> (+{self.cfg.futures_tp1_pct:.1f}% | فعلي +{tp1_eff:.1f}%)\n"
+                f"🎯 TP2: <code>{tp2:.8g}</code> (+{self.cfg.futures_tp2_pct:.1f}% | فعلي +{self.cfg.futures_tp2_pct*lev:.1f}%)\n"
+                f"🛡 SL:  <code>{stop_loss:.8g}</code> (-{self.cfg.futures_sl_pct:.1f}% | فعلي -{sl_eff:.1f}%)\n"
+                f"☠️ Liq: <code>{liq_price:.8g}</code>\n\n"
+                f"🧠 DS={result['ds_vote']} | Llama={result['llama_vote']} | BTC RSI={btc_rsi:.1f}"
+            )
+
+        finally:
+            with self._processing_lock:
+                self._processing_symbols.discard(symbol)
+
+    def _fetch_indicators_futures(self, symbol: str) -> Optional[dict]:
+        """
+        مؤشرات مُحسَّنة للـ Futures — تعتمد على 4H كفريم رئيسي.
+        Futures يحتاج توقيتاً أدق لأن الرافعة تضخم الحركات.
+        """
+        try:
+            # الرمز الأساسي بدون :USDT للبحث في OHLCV
+            spot_symbol = symbol.replace(":USDT", "")
+            # نحاول أولاً على نفس الـ futures symbol، ثم spot
+            try:
+                ohlcv_4h = self.futures_executor.exchange.fetch_ohlcv(
+                    symbol, timeframe="4h", limit=60
+                )
+            except Exception:
+                ohlcv_4h = self.executor.exchange.fetch_ohlcv(
+                    spot_symbol, timeframe="4h", limit=60
+                )
+
+            if not ohlcv_4h or len(ohlcv_4h) < 20:
+                return None
+
+            df_4h   = pd.DataFrame(ohlcv_4h, columns=["ts","open","high","low","close","vol"]).astype(float)
+            closes  = df_4h["close"]
+            current = float(closes.iloc[-1])
+            rsi_4h  = self._calc_rsi(closes)
+
+            # RSI فلتر أصعب للـ Futures
+            if rsi_4h > self.cfg.rsi_threshold:
+                return None
+
+            fib_high = float(df_4h["high"].tail(40).max())
+            fib_low  = float(df_4h["low"].tail(40).min())
+            support  = detect_horizontal_support(df_4h, current)
+            support["score"] = 2 if support.get("touches", 0) >= 3 else (1 if support.get("has_support") else 0)
+
+            vol_usd = 0.0
+            try:
+                t = self.futures_executor.exchange.fetch_ticker(symbol)
+                vol_usd = float(t.get("quoteVolume") or 0)
+            except Exception:
+                try:
+                    t = self.executor.exchange.fetch_ticker(spot_symbol)
+                    vol_usd = float(t.get("quoteVolume") or 0)
+                except Exception:
+                    pass
+
+            return {
+                "current":  current,
+                "rsi":      rsi_4h,
+                "rsi_1d":   rsi_4h,
+                "rsi_4h":   rsi_4h,
+                "rsi_note": f"futures⚡ RSI_4H={rsi_4h:.1f}",
+                "fib_high": fib_high,
+                "fib_low":  fib_low,
+                "vol_usd":  vol_usd,
+                "support":  support,
+            }
+        except Exception as e:
+            _log(f"[Futures Scan] ❌ {symbol}: {str(e)[:60]}")
+            return None
+
     async def scan_loop(self):
         # ── تحذير Futures عند الإطلاق ──
         if self.cfg.market_futures and not self.cfg.market_spot:
@@ -3644,45 +3902,61 @@ class ScalpingOrchestrator:
                     except Exception as e:
                         _log(f"[Scan] load_markets reload failed: {e}")
 
-                    markets = self.executor.exchange.markets
-                    symbols = []
-                    for s, mkt in markets.items():
-                        if self.cfg.market_futures:
-                            # Futures: USDT Perpetual Swap (MEXC format: BTC/USDT:USDT)
-                            if "/USDT:USDT" not in s:
-                                continue
-                        else:
-                            # Spot: USDT pairs only
+                    # ── جمع الأزواج من Spot وFutures معاً ──
+                    spot_symbols    = []
+                    futures_symbols = []
+
+                    # Spot symbols
+                    if self.cfg.market_spot:
+                        for s, mkt in self.executor.exchange.markets.items():
                             if not s.endswith("/USDT"):
                                 continue
                             if ":" in s or "swap" in s.lower() or "future" in s.lower():
                                 continue
+                            base = s.split("/")[0].upper()
+                            if self.cfg.shariah_filter_enabled and base in self.cfg.blacklisted_assets:
+                                continue
+                            if any(base.endswith(p) for p in ["3L","3S","5L","5S"]):
+                                continue
+                            spot_symbols.append(("spot", s))
 
-                        base = s.split("/")[0].upper()
-                        if self.cfg.shariah_filter_enabled and base in self.cfg.blacklisted_assets:
-                            continue
-                        if any(base.endswith(p) for p in ["3L","3S","5L","5S"]):
-                            continue
-                        symbols.append(s)
+                    # Futures symbols
+                    if self.cfg.market_futures and self.futures_executor:
+                        try:
+                            self.futures_executor.exchange.load_markets(reload=True)
+                        except Exception:
+                            pass
+                        for s, mkt in self.futures_executor.exchange.markets.items():
+                            if "/USDT:USDT" not in s:
+                                continue
+                            base = s.split("/")[0].upper()
+                            if self.cfg.shariah_filter_enabled and base in self.cfg.blacklisted_assets:
+                                continue
+                            futures_symbols.append(("futures", s))
 
-                    market_label = "Futures Perpetual" if self.cfg.market_futures else "Spot/USDT"
-                    _log(f"[Scan] {len(symbols)} عملة {market_label} جاهزة للفحص")
+                    all_symbols = spot_symbols + futures_symbols
+                    _log(
+                        f"[Scan] {len(spot_symbols)} Spot + {len(futures_symbols)} Futures "
+                        f"= {len(all_symbols)} زوج جاهز للفحص"
+                    )
 
                     BATCH = 5
                     async with aiohttp.ClientSession() as session:
-                        for i in range(0, len(symbols), BATCH):
-                            batch = symbols[i:i+BATCH]
-                            # ── الاستراتيجيتان بالتوازي في كل batch ──
+                        for i in range(0, len(all_symbols), BATCH):
+                            batch = all_symbols[i:i+BATCH]
                             tasks = []
-                            for sym in batch:
-                                # استراتيجية 1: التشبع البيعي (RSI ≤ 30)
-                                tasks.append(self._process_candidate(session, sym, initial_balance))
-                                # استراتيجية 2: الزخم (RSI 50-65 + breakout) — slots مشتركة
-                                tasks.append(self._process_momentum_candidate(session, sym, initial_balance))
+                            for market_type, sym in batch:
+                                if market_type == "spot":
+                                    # استراتيجيتا Spot
+                                    tasks.append(self._process_candidate(session, sym, initial_balance))
+                                    tasks.append(self._process_momentum_candidate(session, sym, initial_balance))
+                                else:
+                                    # استراتيجية Futures (تشبع بيعي فقط، بأهداف مختلفة)
+                                    tasks.append(self._process_futures_candidate(session, sym, initial_balance))
                             await asyncio.gather(*tasks, return_exceptions=True)
                             checked = i + len(batch)
                             if checked % 50 == 0:
-                                _log(f"[Scan] {checked}/{len(symbols)} | slots={self.slots.used}/{self.cfg.max_slots}")
+                                _log(f"[Scan] {checked}/{len(all_symbols)} | slots={self.slots.used}/{self.cfg.max_slots}")
                             await asyncio.sleep(2)
 
                 except Exception as e:
