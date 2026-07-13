@@ -81,6 +81,18 @@ class Config:
     s2_tp1_pct:         float = field(default_factory=lambda: float(os.environ.get("S2_TP1_PCT", "3")))
     s2_tp2_pct:         float = field(default_factory=lambda: float(os.environ.get("S2_TP2_PCT", "6")))
     s2_tp3_pct:         float = field(default_factory=lambda: float(os.environ.get("S2_TP3_PCT", "9")))
+    # ── إعدادات السوق ──
+    market_spot:         bool  = field(default_factory=lambda: os.environ.get("MARKET_SPOT", "true").lower() == "true")
+    market_futures:      bool  = field(default_factory=lambda: os.environ.get("MARKET_FUTURES", "false").lower() == "true")
+
+    # ── إعدادات Futures (تُستخدم فقط عند MARKET_FUTURES=true) ──
+    futures_leverage:    int   = field(default_factory=lambda: int(os.environ.get("FUTURES_LEVERAGE", "2")))        # رافعة آمنة — لا تتجاوز 5x
+    futures_margin_mode: str   = field(default_factory=lambda: os.environ.get("FUTURES_MARGIN_MODE", "isolated"))   # isolated أأمن من cross
+    futures_sl_pct:      float = field(default_factory=lambda: float(os.environ.get("FUTURES_SL_PCT", "1.0")))      # -1% بالرافعة = -2% فعلي
+    futures_tp1_pct:     float = field(default_factory=lambda: float(os.environ.get("FUTURES_TP1_PCT", "2.0")))     # +2% بالرافعة = +4% فعلي
+    futures_tp2_pct:     float = field(default_factory=lambda: float(os.environ.get("FUTURES_TP2_PCT", "3.5")))     # +3.5% بالرافعة = +7% فعلي
+    futures_liq_buffer:  float = field(default_factory=lambda: float(os.environ.get("FUTURES_LIQ_BUFFER_PCT", "50"))) # هامش أمان 50% من Liquidation
+
     blacklisted_assets: set   = field(default_factory=lambda: {
         # ── إقراض بفائدة (Lending/Interest protocols) ──
         "AAVE", "COMP", "MKR", "CRV", "LDO", "UNI", "SUSHI", "BAL",
@@ -345,6 +357,14 @@ class SlotState:
     break_even_attempted: bool  = False
     extended:             bool  = False
     db_trade_id:          str   = ""  # Supabase UUID
+    # ── حقول Futures (فارغة في Spot) ──
+    is_futures:           bool  = False
+    leverage:             int   = 1
+    liquidation_price:    float = 0.0   # سعر التصفية — خط الموت
+    margin_used:          float = 0.0   # الهامش المستخدم فعلاً
+    funding_rate:         float = 0.0   # آخر معدل تمويل (كل 8 ساعات)
+    funding_cost_usd:     float = 0.0   # تكلفة التمويل المتراكمة
+    position_side:        str   = "long" # long أو short
 
 
 class SlotManager:
@@ -678,6 +698,71 @@ class DataPipeline:
 # ─────────────────────────────────────────────
 # 4. FIBONACCI ENGINE
 # ─────────────────────────────────────────────
+def calculate_liquidation_price(
+    entry_price: float,
+    leverage: int,
+    margin_mode: str = "isolated",
+    position_side: str = "long",
+    maintenance_margin_rate: float = 0.004,  # MEXC Futures: 0.4% للعقود الصغيرة
+) -> float:
+    """
+    يحسب سعر التصفية (Liquidation Price) بدقة لـ MEXC Futures.
+
+    معادلة Isolated Margin (Long):
+    Liq = Entry × (1 - 1/Leverage + Maintenance_Margin_Rate)
+
+    معادلة Isolated Margin (Short):
+    Liq = Entry × (1 + 1/Leverage - Maintenance_Margin_Rate)
+
+    المصدر: MEXC Futures Documentation
+    """
+    if leverage <= 0:
+        return 0.0
+
+    if margin_mode == "isolated":
+        if position_side == "long":
+            liq = entry_price * (1 - 1/leverage + maintenance_margin_rate)
+        else:
+            liq = entry_price * (1 + 1/leverage - maintenance_margin_rate)
+    else:
+        # Cross margin — أخطر، نستخدم نفس الحساب كتقدير محافظ
+        if position_side == "long":
+            liq = entry_price * (1 - 1/leverage + maintenance_margin_rate)
+        else:
+            liq = entry_price * (1 + 1/leverage - maintenance_margin_rate)
+
+    return round(liq, 10)
+
+
+def calculate_safe_sl_futures(
+    entry_price: float,
+    leverage: int,
+    sl_pct: float,
+    liq_price: float,
+    liq_buffer_pct: float = 50.0,
+) -> float:
+    """
+    يحسب SL آمن للـ Futures يضمن:
+    1. لا يتجاوز sl_pct% من سعر الدخول
+    2. يبقى فوق (أو أسفل للـ short) سعر التصفية بهامش أمان كافٍ
+
+    هامش الأمان الافتراضي: 50% من المسافة بين الدخول والتصفية
+    """
+    sl_from_pct = entry_price * (1 - sl_pct / 100)
+
+    # هامش الأمان من Liquidation (50% من المسافة بين الدخول والتصفية)
+    if liq_price > 0:
+        safety_distance = abs(entry_price - liq_price) * (liq_buffer_pct / 100)
+        sl_min_safe = liq_price + safety_distance  # Long: SL يجب أن يكون فوق liq
+
+        # نأخذ الأعلى (الأكثر أماناً)
+        sl = max(sl_from_pct, sl_min_safe)
+    else:
+        sl = sl_from_pct
+
+    return round(sl, 10)
+
+
 def calculate_cascading_targets(fib_high: float, fib_low: float, entry: float) -> dict:
     """
     Cascading Fibonacci targets — تضمن entry < tp1 < tp2 < tp3.
@@ -1026,19 +1111,45 @@ class HighSpeedExecutor:
         self.exchange = self._connect()
 
     def _connect(self) -> ccxt.mexc:
+        """
+        يتصل بـ MEXC Spot أو Futures حسب إعداد Railway.
+        Futures: defaultType="swap" يُفعِّل عقود USDT-Margined Perpetual.
+        Spot:    defaultType="spot" (الافتراضي الآمن).
+
+        تحذير: عند MARKET_FUTURES=true يجب التأكد من:
+        - وجود رصيد في Futures Wallet (منفصل عن Spot)
+        - تفعيل Futures على حساب MEXC يدوياً
+        """
+        market_type = "swap" if self.cfg.market_futures else "spot"
+        fetch_markets = ["swap"] if self.cfg.market_futures else ["spot"]
+
         ex = ccxt.mexc({
             "apiKey":  self.cfg.mexc_api_key,
             "secret":  self.cfg.mexc_api_secret,
             "options": {
-                "defaultType":                       "spot",
-                "fetchMarkets":                      ["spot"],
+                "defaultType":                       market_type,
+                "fetchMarkets":                      fetch_markets,
                 "createMarketBuyOrderRequiresPrice": False,
             },
             "enableRateLimit": True,
             "timeout":         60_000,
         })
         ex.load_markets()
-        _log(f"✅ Executor connected — {len(ex.markets)} markets loaded")
+        mode = "🔄 Futures (Perpetual Swap)" if self.cfg.market_futures else "🟢 Spot"
+        _log(f"✅ Executor connected [{mode}] — {len(ex.markets)} markets loaded")
+        return ex
+
+    def _connect_spot_reference(self) -> ccxt.mexc:
+        """اتصال Spot منفصل لجلب بيانات السوق حتى في وضع Futures."""
+        ex = ccxt.mexc({
+            "apiKey":  self.cfg.mexc_api_key,
+            "secret":  self.cfg.mexc_api_secret,
+            "options": {"defaultType": "spot", "fetchMarkets": ["spot"],
+                        "createMarketBuyOrderRequiresPrice": False},
+            "enableRateLimit": True,
+            "timeout":         60_000,
+        })
+        ex.load_markets()
         return ex
 
     def _ensure_markets(self):
@@ -1068,27 +1179,31 @@ class HighSpeedExecutor:
         return round(qty, 4)
 
     def market_buy(self, symbol: str, entry_price: float) -> Optional[dict]:
+        """
+        ينفذ أمر شراء — يدعم Spot وFutures.
+
+        Spot:    market buy بالقيمة الإجمالية (quoteOrderQty)
+        Futures: يضبط Leverage وMargin Mode أولاً، ثم يفتح Long position
+                 بحجم يُحسب من رأس المال × الرافعة
+        """
         capital    = self.cfg.capital
         live_price = self._live_price(symbol, entry_price)
         if not live_price or live_price <= 0:
             _log(f"[Executor] {symbol}: live price = 0 — abort")
             return None
 
-        _log(f"[Executor] BUY {symbol} | signal={entry_price:.8g} live={live_price:.8g} ${capital:.2f}")
+        _log(f"[Executor] {'FUTURES' if self.cfg.market_futures else 'SPOT'} BUY {symbol} | "
+             f"signal={entry_price:.8g} live={live_price:.8g} ${capital:.2f}"
+             + (f" | leverage={self.cfg.futures_leverage}x" if self.cfg.market_futures else ""))
+
         try:
             self._ensure_markets()
-            # Apply exchange precision to capital amount
-            try:
-                precise_capital = float(self.exchange.cost_to_precision(symbol, capital))
-            except Exception:
-                precise_capital = capital
-            order = self.exchange.create_market_buy_order(
-                symbol, precise_capital, {"quoteOrderQty": precise_capital}
-            )
-            filled_price = float(order.get("average") or order.get("price") or live_price)
-            filled_qty   = float(order.get("filled") or (capital / filled_price))
-            _log(f"✅ FILLED {symbol}: {filled_qty:.6f} @ {filled_price:.8g} ID:{order['id']}")
-            return {"order_id": order["id"], "filled_price": filled_price, "filled_qty": filled_qty}
+
+            if self.cfg.market_futures:
+                return self._futures_open_long(symbol, live_price, capital)
+            else:
+                return self._spot_market_buy(symbol, live_price, capital)
+
         except ccxt.InsufficientFunds as e:
             _log(f"[Executor] InsufficientFunds {symbol}: {e}")
         except ccxt.NetworkError as e:
@@ -1098,6 +1213,110 @@ class HighSpeedExecutor:
         except Exception as e:
             _log(f"[Executor] ERROR {symbol}: {e}")
         return None
+
+    def _spot_market_buy(self, symbol: str, live_price: float, capital: float) -> Optional[dict]:
+        """تنفيذ شراء Spot عادي."""
+        try:
+            precise_capital = float(self.exchange.cost_to_precision(symbol, capital))
+        except Exception:
+            precise_capital = capital
+        order = self.exchange.create_market_buy_order(
+            symbol, precise_capital, {"quoteOrderQty": precise_capital}
+        )
+        filled_price = float(order.get("average") or order.get("price") or live_price)
+        filled_qty   = float(order.get("filled") or (capital / filled_price))
+        _log(f"✅ SPOT FILLED {symbol}: {filled_qty:.6f} @ {filled_price:.8g} ID:{order['id']}")
+        return {"order_id": order["id"], "filled_price": filled_price, "filled_qty": filled_qty,
+                "is_futures": False}
+
+    def _futures_open_long(self, symbol: str, live_price: float, capital: float) -> Optional[dict]:
+        """
+        فتح Long position في Futures مع ضبط Leverage وMargin Mode.
+
+        الحجم = (رأس المال × الرافعة) / سعر الدخول
+        مثال: ($20 × 2x) / $0.5 = 80 وحدة
+
+        خطوات الأمان:
+        1. ضبط Isolated Margin (أأمن من Cross)
+        2. ضبط الرافعة
+        3. فتح Long market order
+        4. استرداد Liquidation Price من الـ position
+        """
+        lev = self.cfg.futures_leverage
+
+        # ── الخطوة 1: ضبط Margin Mode (Isolated) ──
+        try:
+            self.exchange.set_margin_mode(
+                self.cfg.futures_margin_mode, symbol,
+                params={"leverage": lev}
+            )
+        except Exception as e:
+            # MEXC قد يُعيد خطأ إذا كان الوضع مضبوطاً بالفعل
+            if "already" not in str(e).lower():
+                _log(f"[Futures] Margin mode warning {symbol}: {str(e)[:60]}")
+
+        # ── الخطوة 2: ضبط الرافعة ──
+        try:
+            self.exchange.set_leverage(lev, symbol)
+            _log(f"[Futures] {symbol}: Leverage={lev}x Margin={self.cfg.futures_margin_mode}")
+        except Exception as e:
+            _log(f"[Futures] Leverage warning {symbol}: {str(e)[:60]}")
+
+        # ── الخطوة 3: حساب الحجم ──
+        # الحجم بالعملة = (رأس المال × الرافعة) / سعر الدخول
+        notional = capital * lev
+        qty_raw  = notional / live_price
+        qty      = self._apply_step_size(symbol, qty_raw)
+
+        if qty <= 0:
+            _log(f"[Futures] {symbol}: qty=0 — abort")
+            return None
+
+        # ── الخطوة 4: فتح Long Position ──
+        order = self.exchange.create_market_buy_order(
+            symbol, qty,
+            params={"positionSide": "LONG"}
+        )
+        filled_price = float(order.get("average") or order.get("price") or live_price)
+        filled_qty   = float(order.get("filled") or qty)
+
+        # ── الخطوة 5: جلب Liquidation Price من المنصة ──
+        liq_price = 0.0
+        try:
+            time.sleep(1)  # انتظار لتحديث الـ position
+            positions = self.exchange.fetch_positions([symbol])
+            for pos in positions:
+                if pos.get("symbol") == symbol and float(pos.get("contracts", 0)) > 0:
+                    liq_price = float(pos.get("liquidationPrice") or 0)
+                    margin_used = float(pos.get("initialMargin") or capital)
+                    break
+            if liq_price <= 0:
+                # حساب يدوي كـ fallback
+                liq_price = calculate_liquidation_price(filled_price, lev)
+                margin_used = capital
+        except Exception as e:
+            liq_price   = calculate_liquidation_price(filled_price, lev)
+            margin_used = capital
+            _log(f"[Futures] Liq price fallback {symbol}: {e}")
+
+        # رسوم Taker Futures = 0.06% (أقل من Spot 0.1%)
+        entry_fee = notional * 0.0006
+
+        _log(
+            f"✅ FUTURES LONG {symbol}: {filled_qty:.6f} @ {filled_price:.8g} "
+            f"| Lev={lev}x | Liq={liq_price:.8g} | Margin=${margin_used:.2f} "
+            f"| ID:{order['id']}"
+        )
+        return {
+            "order_id":      order["id"],
+            "filled_price":  filled_price,
+            "filled_qty":    filled_qty,
+            "is_futures":    True,
+            "leverage":      lev,
+            "liquidation_price": liq_price,
+            "margin_used":   margin_used,
+            "entry_fee":     entry_fee,
+        }
 
     def place_tp_sl(
         self,
@@ -1210,8 +1429,25 @@ class HighSpeedExecutor:
             _log(f"[Fallback] TP1 limit sell FAILED {symbol}: {e}")
             return None
 
-    def emergency_market_sell(self, symbol: str, qty: float) -> bool:
-        """Fee-adjusted emergency market sell using live free balance."""
+    def emergency_market_sell(self, symbol: str, qty: float, is_futures: bool = False) -> bool:
+        """
+        إغلاق طارئ — يدعم Spot وFutures.
+
+        Spot:    market sell للكمية المتاحة
+        Futures: إغلاق Long position بالكامل (close position)
+                 لا يحتاج كمية — يُغلق كل الـ position دفعة واحدة
+        """
+        try:
+            if is_futures or self.cfg.market_futures:
+                return self._futures_close_long(symbol, qty)
+            else:
+                return self._spot_emergency_sell(symbol, qty)
+        except Exception as e:
+            _log(f"[Emergency] ❌ {symbol}: {str(e)[:120]}")
+            return False
+
+    def _spot_emergency_sell(self, symbol: str, qty: float) -> bool:
+        """إغلاق طارئ Spot."""
         try:
             base_token = symbol.split("/")[0].split("_")[0]
             balance    = self.exchange.fetch_balance({"type": "spot"})
@@ -1219,10 +1455,10 @@ class HighSpeedExecutor:
                 balance.get(base_token, {}).get("free", 0) or
                 balance.get("free", {}).get(base_token, 0)
             )
-            _log(f"[Emergency] {symbol}: cached={qty:.4f} free={free_qty:.4f}")
+            _log(f"[Emergency Spot] {symbol}: cached={qty:.4f} free={free_qty:.4f}")
 
             if free_qty <= 0:
-                _log(f"[Emergency] {symbol}: free=0 — slot released")
+                _log(f"[Emergency Spot] {symbol}: free=0 — slot released")
                 return True
 
             sell_qty = self._apply_step_size(symbol, min(qty, free_qty))
@@ -1235,14 +1471,55 @@ class HighSpeedExecutor:
                 precise_qty = sell_qty
 
             o = self.exchange.create_market_sell_order(symbol, precise_qty)
-            _log(f"[Emergency] ✅ {symbol}: sold {precise_qty} @ market ID:{o['id']}")
+            _log(f"[Emergency Spot] ✅ {symbol}: sold {precise_qty} ID:{o['id']}")
             return True
         except Exception as e:
             err = str(e)
             if "30005" in err or "Oversold" in err:
-                _log(f"[Emergency] {symbol}: 30005 — releasing slot")
+                _log(f"[Emergency Spot] {symbol}: 30005 — releasing slot")
                 return True
-            _log(f"[Emergency] ❌ {symbol}: {err[:120]}")
+            _log(f"[Emergency Spot] ❌ {symbol}: {err[:120]}")
+            return False
+
+    def _futures_close_long(self, symbol: str, qty: float) -> bool:
+        """
+        إغلاق Long position في Futures بالكامل.
+
+        يستخدم reduce_only=True لضمان الإغلاق فقط (لا فتح Short)
+        ويجلب الكمية الفعلية من الـ position لا من الذاكرة.
+        """
+        try:
+            # جلب الكمية الفعلية من المنصة
+            actual_qty = 0.0
+            try:
+                positions = self.exchange.fetch_positions([symbol])
+                for pos in positions:
+                    if pos.get("symbol") == symbol and pos.get("side") == "long":
+                        actual_qty = float(pos.get("contracts") or pos.get("amount") or 0)
+                        break
+            except Exception:
+                actual_qty = qty
+
+            close_qty = self._apply_step_size(symbol, actual_qty if actual_qty > 0 else qty)
+            if close_qty <= 0:
+                _log(f"[Emergency Futures] {symbol}: qty=0 — position likely already closed")
+                return True
+
+            o = self.exchange.create_market_sell_order(
+                symbol, close_qty,
+                params={
+                    "positionSide": "LONG",
+                    "reduceOnly":   True,
+                }
+            )
+            _log(f"[Emergency Futures] ✅ {symbol}: closed {close_qty} Long ID:{o['id']}")
+            return True
+        except Exception as e:
+            err = str(e)
+            if "position" in err.lower() and "not exist" in err.lower():
+                _log(f"[Emergency Futures] {symbol}: position already closed")
+                return True
+            _log(f"[Emergency Futures] ❌ {symbol}: {err[:120]}")
             return False
 
     def cancel_order(self, symbol: str, order_id: str):
@@ -1292,22 +1569,33 @@ class HighSpeedExecutor:
         # Entry fee: 0.1% taker on market buy
         entry_fee = self.cfg.capital * 0.001
 
+        # بيانات Futures إضافية
+        is_futures      = buy.get("is_futures", False)
+        leverage        = buy.get("leverage", 1)
+        liq_price       = buy.get("liquidation_price", 0.0)
+        margin_used     = buy.get("margin_used", self.cfg.capital)
+
         return SlotState(
-            symbol       = symbol,
-            buy_order_id = buy["order_id"],
-            tp1_order_id = bracket.get("tp1_order_id", ""),
-            sl_order_id  = "",
-            entry_price  = buy["filled_price"],
-            filled_qty   = buy["filled_qty"],
-            tp1          = effective_tp1,
-            tp2          = effective_tp2,
-            tp3          = effective_tp3,
-            stop_loss    = stop_loss,
-            entry_fee    = entry_fee,
-            qty_tp1      = bracket.get("qty_tp1", buy["filled_qty"] * 0.30),
-            qty_tp2      = bracket.get("qty_tp2", buy["filled_qty"] * 0.20),
-            qty_tp3      = bracket.get("qty_tp3", buy["filled_qty"] * 0.20),
-            entry_time   = time.time(),
+            symbol            = symbol,
+            buy_order_id      = buy["order_id"],
+            tp1_order_id      = bracket.get("tp1_order_id", ""),
+            sl_order_id       = "",
+            entry_price       = buy["filled_price"],
+            filled_qty        = buy["filled_qty"],
+            tp1               = effective_tp1,
+            tp2               = effective_tp2,
+            tp3               = effective_tp3,
+            stop_loss         = stop_loss,
+            entry_fee         = entry_fee,
+            qty_tp1           = bracket.get("qty_tp1", buy["filled_qty"] * 0.80),
+            qty_tp2           = bracket.get("qty_tp2", buy["filled_qty"] * 0.20),
+            qty_tp3           = bracket.get("qty_tp3", buy["filled_qty"] * 0.00),
+            entry_time        = time.time(),
+            is_futures        = is_futures,
+            leverage          = leverage,
+            liquidation_price = liq_price,
+            margin_used       = margin_used,
+            position_side     = "long",
         )
 
 
@@ -1379,6 +1667,39 @@ class TradeMonitor:
 
         if curr_price <= 0:
             return
+
+        # ── Futures: فحص Liquidation Price وFunding Rate ──
+        if state.is_futures:
+            # تحذير إذا اقترب السعر من سعر التصفية (أقل من 20% مسافة)
+            if state.liquidation_price > 0:
+                liq_distance_pct = abs(curr_price - state.liquidation_price) / curr_price * 100
+                if liq_distance_pct < 20:
+                    _log(
+                        f"[Futures ⚠️] {symbol}: سعر التصفية قريب! "
+                        f"curr={curr_price:.8g} liq={state.liquidation_price:.8g} "
+                        f"(مسافة {liq_distance_pct:.1f}%)"
+                    )
+                    # إرسال تنبيه طارئ فوري
+                    await self._notify(
+                        f"🚨 <b>تحذير Futures — سعر التصفية قريب!</b>\n\n"
+                        f"• <b>العملة:</b> <code>{symbol}</code>\n"
+                        f"• <b>السعر الحالي:</b> <code>{curr_price:.8g}</code>\n"
+                        f"• <b>سعر التصفية:</b> <code>{state.liquidation_price:.8g}</code>\n"
+                        f"• <b>المسافة:</b> <code>{liq_distance_pct:.1f}%</code> فقط!\n\n"
+                        f"<i>SL سيُنفَّذ قريباً لحماية الحساب.</i>"
+                    )
+
+            # تحديث تكلفة Funding Rate (كل 8 ساعات)
+            age_hours = (time.time() - state.entry_time) / 3600
+            if age_hours > 0 and state.funding_rate > 0:
+                expected_funding_payments = int(age_hours / 8)
+                total_funding_cost = state.margin_used * state.funding_rate * expected_funding_payments
+                if total_funding_cost != state.funding_cost_usd:
+                    self.slots.update_state(symbol, funding_cost_usd=total_funding_cost)
+                    _log(
+                        f"[Futures] {symbol}: Funding cost=${total_funding_cost:.4f} "
+                        f"({expected_funding_payments} payments)"
+                    )
 
         # ── Shadow SL Monitor ──
         if state.stop_loss > 0 and curr_price <= state.stop_loss:
@@ -1806,6 +2127,18 @@ class TradeMonitor:
                 )
             )
 
+        # بيانات إضافية للـ Futures
+        futures_line = ""
+        if state.is_futures:
+            effective_pnl = net_pnl_usd - state.funding_cost_usd
+            lev_str = f"{state.leverage}x"
+            futures_line = (
+                f"⚡ <b>Futures:</b> Leverage={lev_str} | "
+                f"Funding cost=${state.funding_cost_usd:.4f}\n"
+                f"💰 <b>PnL بعد Funding:</b> {emoji} "
+                f"<b>${'+' if effective_pnl>=0 else ''}{effective_pnl:.3f}</b>\n"
+            )
+
         await self._notify(
             f"{label}\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1816,6 +2149,7 @@ class TradeMonitor:
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"⏳ <b>المدة:</b> <code>{duration}</code>\n"
             f"💸 <b>رسوم المنصة:</b> <code>${total_fees_usd:.4f}</code>\n"
+            f"{futures_line}"
             f"📊 <b>الربح الصافي:</b> {emoji} <b>${sign_pnl}{net_pnl_usd:.3f} ({sign_pct}{net_pnl_pct:.2f}%)</b>\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"خطة الخروج: TP1=+{tp1_pct:.1f}% | TP2=+{tp2_pct:.1f}% | TP3=+{tp3_pct:.1f}% | SL=-{sl_pct:.1f}%"
@@ -1856,6 +2190,88 @@ class ScalpingOrchestrator:
         self._processing_lock:      threading.Lock = threading.Lock()
         self._last_api_health_alert: float = 0.0  # آخر وقت أُرسل فيه تنبيه API health
 
+
+
+    def _restore_futures_positions(self):
+        """
+        يسترد Futures positions المفتوحة من MEXC عند Restart.
+        Futures positions تُسترد من fetch_positions() لا من fetch_balance().
+        """
+        _log("[Futures Restore] 🔄 استرداد Futures positions...")
+        try:
+            positions = self.executor.exchange.fetch_positions()
+            restored  = 0
+
+            for pos in positions:
+                contracts = float(pos.get("contracts") or pos.get("amount") or 0)
+                if contracts <= 0:
+                    continue
+                if pos.get("side") != "long":
+                    continue  # ندعم Long فقط حالياً
+
+                symbol    = pos.get("symbol", "")
+                if not symbol or symbol not in self.executor.exchange.markets:
+                    continue
+
+                if self.slots.used >= self.cfg.max_slots:
+                    break
+
+                entry_price  = float(pos.get("entryPrice") or pos.get("averagePrice") or 0)
+                liq_price    = float(pos.get("liquidationPrice") or 0)
+                margin_used  = float(pos.get("initialMargin") or self.cfg.capital)
+                leverage     = int(pos.get("leverage") or self.cfg.futures_leverage)
+                unrealized   = float(pos.get("unrealizedPnl") or 0)
+
+                if entry_price <= 0:
+                    continue
+
+                # SL آمن بعيد عن Liquidation
+                stop_loss = calculate_safe_sl_futures(
+                    entry_price, leverage,
+                    self.cfg.futures_sl_pct,
+                    liq_price,
+                    self.cfg.futures_liq_buffer,
+                )
+
+                # أهداف من إعدادات Railway
+                tp1 = entry_price * (1 + self.cfg.futures_tp1_pct / 100)
+                tp2 = entry_price * (1 + self.cfg.futures_tp2_pct / 100)
+                tp3 = tp2 * 1.02
+
+                state = SlotState(
+                    symbol            = symbol,
+                    buy_order_id      = "restored_futures",
+                    entry_price       = entry_price,
+                    filled_qty        = contracts,
+                    tp1               = tp1,
+                    tp2               = tp2,
+                    tp3               = tp3,
+                    stop_loss         = stop_loss,
+                    qty_tp1           = round(contracts * 0.80, 6),
+                    qty_tp2           = round(contracts * 0.20, 6),
+                    qty_tp3           = 0.0,
+                    entry_time        = time.time(),
+                    is_futures        = True,
+                    leverage          = leverage,
+                    liquidation_price = liq_price,
+                    margin_used       = margin_used,
+                    position_side     = "long",
+                )
+                self.slots.occupy(state)
+                restored += 1
+
+                liq_dist = abs(entry_price - liq_price) / entry_price * 100 if liq_price > 0 else 0
+                _log(
+                    f"[Futures Restore] ✅ {symbol}: "
+                    f"qty={contracts:.4f} entry={entry_price:.8g} "
+                    f"Lev={leverage}x Liq={liq_price:.8g} ({liq_dist:.1f}% مسافة) "
+                    f"PnL={unrealized:+.4f}"
+                )
+
+            _log(f"[Futures Restore] اكتمل — {restored} position مُستردة")
+
+        except Exception as e:
+            _log(f"[Futures Restore] ⚠️ خطأ: {e}")
 
     def _post_restore_health_check(self):
         """
@@ -2024,6 +2440,12 @@ class ScalpingOrchestrator:
                 _log("[Restore] Supabase غير متاح — سيُستخدم Fallback")
 
             # ── المرحلة 2: فحص الرصيد الفعلي على MEXC ──
+            if self.cfg.market_futures:
+                # ── Futures Restore: نجلب من open positions ──
+                self._restore_futures_positions()
+                return
+
+            # ── Spot Restore ──
             bal      = self.executor.exchange.fetch_balance({"type": "spot"})
             balances = bal.get("total", {})
 
@@ -2377,14 +2799,41 @@ class ScalpingOrchestrator:
             return
 
         targets   = result["targets"]
-        raw_sl    = await asyncio.get_running_loop().run_in_executor(
-            None, calculate_micro_swing_sl,
-            self.executor.exchange, symbol, ind["current"]
-        )
-        # تطبيق نطاق SL من متغيرات Railway
-        sl_min = ind["current"] * (1 - self.cfg.s1_sl_max / 100)  # -s1_sl_max%
-        sl_max = ind["current"] * (1 - self.cfg.s1_sl_min / 100)  # -s1_sl_min%
-        stop_loss = max(sl_min, min(raw_sl, sl_max))
+
+        if self.cfg.market_futures:
+            # ── Futures: SL وTP محسوبة من إعدادات Railway مباشرة ──
+            entry_est  = ind["current"]
+            liq_price  = calculate_liquidation_price(
+                entry_est, self.cfg.futures_leverage,
+                self.cfg.futures_margin_mode
+            )
+            stop_loss  = calculate_safe_sl_futures(
+                entry_est,
+                self.cfg.futures_leverage,
+                self.cfg.futures_sl_pct,
+                liq_price,
+                self.cfg.futures_liq_buffer,
+            )
+            # أهداف Futures أصغر (بالرافعة تصبح مضخَّمة)
+            targets = {
+                "tp1": entry_est * (1 + self.cfg.futures_tp1_pct / 100),
+                "tp2": entry_est * (1 + self.cfg.futures_tp2_pct / 100),
+                "tp3": entry_est * (1 + self.cfg.futures_tp2_pct / 100 * 1.5),
+            }
+            _log(
+                f"[Futures Targets] {symbol}: "
+                f"Liq={liq_price:.8g} SL={stop_loss:.8g} "
+                f"TP1={targets['tp1']:.8g} TP2={targets['tp2']:.8g}"
+            )
+        else:
+            # ── Spot: SL ديناميكي من swing lows ──
+            raw_sl    = await asyncio.get_running_loop().run_in_executor(
+                None, calculate_micro_swing_sl,
+                self.executor.exchange, symbol, ind["current"]
+            )
+            sl_min = ind["current"] * (1 - self.cfg.s1_sl_max / 100)
+            sl_max = ind["current"] * (1 - self.cfg.s1_sl_min / 100)
+            stop_loss = max(sl_min, min(raw_sl, sl_max))
 
         _log(
             f"[L2 ✅] {symbol} ({result['elapsed']}s) | "
@@ -3119,6 +3568,28 @@ class ScalpingOrchestrator:
         _log(f"[Reassess] اكتمل — {len(actions)} إجراء")
 
     async def scan_loop(self):
+        # ── تحذير Futures عند الإطلاق ──
+        if self.cfg.market_futures and not self.cfg.market_spot:
+            await self._send_telegram(
+                "⚡ <b>تحذير: وضع Futures مفعَّل</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"• <b>الرافعة:</b> <code>{self.cfg.futures_leverage}x</code>\n"
+                f"• <b>Margin Mode:</b> <code>{self.cfg.futures_margin_mode}</code>\n"
+                f"• <b>SL:</b> <code>-{self.cfg.futures_sl_pct}%</code> "
+                f"(فعلي: -{self.cfg.futures_sl_pct * self.cfg.futures_leverage:.1f}% بالرافعة)\n"
+                f"• <b>TP1:</b> <code>+{self.cfg.futures_tp1_pct}%</code> "
+                f"(فعلي: +{self.cfg.futures_tp1_pct * self.cfg.futures_leverage:.1f}% بالرافعة)\n\n"
+                "⚠️ <b>تأكد من وجود رصيد في Futures Wallet على MEXC</b>\n"
+                "<i>Spot Wallet لا يُستخدم في Futures.</i>"
+            )
+        elif self.cfg.market_futures and self.cfg.market_spot:
+            await self._send_telegram(
+                "⚡ <b>وضع مزدوج: Spot + Futures</b>\n"
+                f"Spot: S1 (RSI≤{self.cfg.rsi_threshold}) + S2 (Momentum)\n"
+                f"Futures: Long {self.cfg.futures_leverage}x | SL=-{self.cfg.futures_sl_pct}% | "
+                f"TP1=+{self.cfg.futures_tp1_pct}%"
+            )
+
         await self._send_telegram(
             f"🤖 <b>Scalping Engine v3 نشط</b> | فلتر الشريعة: {'✅ مفعّل' if self.cfg.shariah_filter_enabled else '⏸ موقوف مؤقتاً'}\n"
             f"🛡️ S1 (تشبع): RSI≤{self.cfg.rsi_threshold} | SL -{self.cfg.s1_sl_min}%~-{self.cfg.s1_sl_max}% | BTC≥{self.cfg.s1_btc_rsi_min:.0f}\n"
@@ -3176,18 +3647,26 @@ class ScalpingOrchestrator:
                     markets = self.executor.exchange.markets
                     symbols = []
                     for s, mkt in markets.items():
-                        if not s.endswith("/USDT"):
-                            continue
-                        if ":" in s or "swap" in s.lower() or "future" in s.lower():
-                            continue
+                        if self.cfg.market_futures:
+                            # Futures: USDT Perpetual Swap (MEXC format: BTC/USDT:USDT)
+                            if "/USDT:USDT" not in s:
+                                continue
+                        else:
+                            # Spot: USDT pairs only
+                            if not s.endswith("/USDT"):
+                                continue
+                            if ":" in s or "swap" in s.lower() or "future" in s.lower():
+                                continue
+
                         base = s.split("/")[0].upper()
                         if self.cfg.shariah_filter_enabled and base in self.cfg.blacklisted_assets:
                             continue
-                        if any(s.endswith(p) for p in ["3L/USDT","3S/USDT","5L/USDT","5S/USDT","UP/USDT","DOWN/USDT","BULL/USDT","BEAR/USDT"]):
+                        if any(base.endswith(p) for p in ["3L","3S","5L","5S"]):
                             continue
                         symbols.append(s)
 
-                    _log(f"[Scan] {len(symbols)} عملة Spot/USDT جاهزة للفحص")
+                    market_label = "Futures Perpetual" if self.cfg.market_futures else "Spot/USDT"
+                    _log(f"[Scan] {len(symbols)} عملة {market_label} جاهزة للفحص")
 
                     BATCH = 5
                     async with aiohttp.ClientSession() as session:
