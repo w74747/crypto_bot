@@ -66,6 +66,20 @@ class Config:
     # ── استراتيجية التشبع البيعي (S1) ──
     s1_btc_rsi_min:     float = field(default_factory=lambda: float(os.environ.get("S1_BTC_RSI_MIN", "40")))
     s1_rsi_extreme:     float = field(default_factory=lambda: float(os.environ.get("S1_RSI_EXTREME", "22")))   # يتجاوز شرط القاعدة
+
+    # ── استراتيجية RSI Bounce Confirmation ──
+    rsi_bounce_enabled: bool  = field(default_factory=lambda: os.environ.get("RSI_BOUNCE_ENABLED", "true").lower() == "true")
+    rsi_bounce_entry:   float = field(default_factory=lambda: float(os.environ.get("RSI_BOUNCE_ENTRY", "35")))   # RSI يتجاوز هذا صعوداً = تأكيد
+    rsi_bounce_lookback:int   = field(default_factory=lambda: int(os.environ.get("RSI_BOUNCE_LOOKBACK", "5")))   # عدد الشموع للبحث عن القاع
+
+    # ── استراتيجية EMA Crossover ──
+    ema_cross_enabled:  bool  = field(default_factory=lambda: os.environ.get("EMA_CROSS_ENABLED", "true").lower() == "true")
+    ema_fast:           int   = field(default_factory=lambda: int(os.environ.get("EMA_FAST", "9")))
+    ema_slow:           int   = field(default_factory=lambda: int(os.environ.get("EMA_SLOW", "21")))
+
+    # ── Cost Gate ──
+    cost_gate_enabled:  bool  = field(default_factory=lambda: os.environ.get("COST_GATE_ENABLED", "true").lower() == "true")
+    cost_gate_pct:      float = field(default_factory=lambda: float(os.environ.get("COST_GATE_PCT", "0.6")))     # الحركة المتوقعة الأدنى %
     s1_sl_min:          float = field(default_factory=lambda: float(os.environ.get("S1_SL_MIN_PCT", "2")))     # % أضيق SL
     s1_sl_max:          float = field(default_factory=lambda: float(os.environ.get("S1_SL_MAX_PCT", "3")))     # % أوسع SL
     s1_tp1_floor:       float = field(default_factory=lambda: float(os.environ.get("S1_TP1_FLOOR_PCT", "6")))  # حد أدنى TP1
@@ -92,6 +106,11 @@ class Config:
     futures_tp1_pct:     float = field(default_factory=lambda: float(os.environ.get("FUTURES_TP1_PCT", "2.0")))     # +2% بالرافعة = +4% فعلي
     futures_tp2_pct:     float = field(default_factory=lambda: float(os.environ.get("FUTURES_TP2_PCT", "3.5")))     # +3.5% بالرافعة = +7% فعلي
     futures_liq_buffer:  float = field(default_factory=lambda: float(os.environ.get("FUTURES_LIQ_BUFFER_PCT", "50"))) # هامش أمان 50% من Liquidation
+
+    # ── الرافعة الديناميكية ──
+    futures_leverage_min: int  = field(default_factory=lambda: int(os.environ.get("FUTURES_LEVERAGE_MIN", "1")))   # حد أدنى مطلق
+    futures_leverage_max: int  = field(default_factory=lambda: int(os.environ.get("FUTURES_LEVERAGE_MAX", "5")))   # حد أقصى مطلق (لا تتجاوز 5 للأمان)
+    futures_dynamic_lev:  bool = field(default_factory=lambda: os.environ.get("FUTURES_DYNAMIC_LEVERAGE", "true").lower() == "true")  # تفعيل/إيقاف الديناميكي
 
     blacklisted_assets: set   = field(default_factory=lambda: {
         # ── إقراض بفائدة (Lending/Interest protocols) ──
@@ -698,6 +717,140 @@ class DataPipeline:
 # ─────────────────────────────────────────────
 # 4. FIBONACCI ENGINE
 # ─────────────────────────────────────────────
+def calculate_atr(df: "pd.DataFrame", period: int = 14) -> float:
+    """
+    Average True Range — يقيس متوسط التقلب الحقيقي.
+    True Range = max(High-Low, |High-PrevClose|, |Low-PrevClose|)
+    كلما ارتفع ATR، كلما تقلبت العملة أكثر، وكلما انخفضت الرافعة الآمنة.
+    """
+    try:
+        high  = df["high"]
+        low   = df["low"]
+        close = df["close"]
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low  - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        return float(tr.rolling(period).mean().iloc[-1])
+    except Exception:
+        return 0.0
+
+
+def calculate_dynamic_leverage(
+    entry_price:   float,
+    atr:           float,
+    rsi:           float,
+    support_score: int,
+    whale_signal:  str,
+    galaxy_score:  float,
+    sl_pct:        float,
+    lev_min:       int = 1,
+    lev_max:       int = 5,
+) -> tuple[int, str]:
+    """
+    يحسب الرافعة المثلى ديناميكياً بناءً على قوة الإشارة وتقلب العملة.
+
+    المنطق الأساسي:
+    ─────────────────
+    رافعة آمنة = SL% / (ATR% × 2)
+    كلما كانت ATR أصغر (أقل تقلباً) → رافعة أعلى مسموحة
+    كلما كانت الإشارة أقوى → رافعة أعلى ضمن الحد الآمن
+
+    نقاط القوة (Confluence Score):
+    ─────────────────────────────
+    +3: RSI < 20 (تشبع شديد جداً)
+    +2: RSI 20-25
+    +1: RSI 25-30
+    +3: دعم أفقي قوي (3+ لمسات)
+    +2: دعم أفقي متوسط (2 لمسات)
+    +2: Whale "buy" signal
+    -3: Whale "sell" signal
+    +1: Galaxy Score > 60
+    -1: Galaxy Score < 30
+
+    النتيجة:
+    ─────────
+    Score ≥ 7 → رافعة عالية (ضمن الحد الآمن)
+    Score 4-6 → رافعة متوسطة
+    Score 1-3 → رافعة منخفضة
+    Score ≤ 0 → الحد الأدنى (1x)
+
+    Returns: (leverage, explanation)
+    """
+    if entry_price <= 0 or atr <= 0:
+        return lev_min, "ATR غير متاح — الحد الأدنى"
+
+    # ── حساب الحد الآمن من ATR ──
+    atr_pct = (atr / entry_price) * 100
+    # رافعة آمنة = SL% / (ATR% × 2) — ضرب 2 للهامش
+    safe_leverage = sl_pct / (atr_pct * 2) if atr_pct > 0 else lev_max
+    safe_leverage = max(lev_min, min(int(safe_leverage), lev_max))
+
+    # ── حساب نقاط القوة ──
+    score = 0
+    reasons = []
+
+    # RSI
+    if rsi < 20:
+        score += 3
+        reasons.append(f"RSI={rsi:.1f} شديد جداً (+3)")
+    elif rsi < 25:
+        score += 2
+        reasons.append(f"RSI={rsi:.1f} تشبع قوي (+2)")
+    elif rsi < 30:
+        score += 1
+        reasons.append(f"RSI={rsi:.1f} تشبع (+1)")
+
+    # دعم أفقي
+    if support_score >= 2:
+        score += 3
+        reasons.append("دعم قوي 3+ لمسات (+3)")
+    elif support_score == 1:
+        score += 2
+        reasons.append("دعم متوسط (+2)")
+    else:
+        reasons.append("بدون دعم (0)")
+
+    # Whale
+    if whale_signal == "buy":
+        score += 2
+        reasons.append("Whale buy (+2)")
+    elif whale_signal == "sell":
+        score -= 3
+        reasons.append("Whale sell (-3) ⚠️")
+
+    # Galaxy Score
+    if galaxy_score > 60:
+        score += 1
+        reasons.append(f"Galaxy={galaxy_score:.0f} (+1)")
+    elif galaxy_score < 30:
+        score -= 1
+        reasons.append(f"Galaxy={galaxy_score:.0f} (-1)")
+
+    # ── تحويل النقاط إلى رافعة ──
+    if score >= 7:
+        lev_from_score = safe_leverage          # أعلى رافعة آمنة
+    elif score >= 4:
+        lev_from_score = max(lev_min, safe_leverage - 1)
+    elif score >= 1:
+        lev_from_score = max(lev_min, min(2, safe_leverage))
+    else:
+        lev_from_score = lev_min
+
+    # الرافعة النهائية: الأصغر من (الحد الآمن من ATR) و (المقترح من النقاط)
+    final_lev = max(lev_min, min(lev_from_score, safe_leverage, lev_max))
+
+    explanation = (
+        f"ATR={atr_pct:.2f}% → حد آمن={safe_leverage}x | "
+        f"Score={score} → {' | '.join(reasons)} | "
+        f"رافعة نهائية={final_lev}x"
+    )
+
+    return final_lev, explanation
+
+
 def calculate_liquidation_price(
     entry_price: float,
     leverage: int,
@@ -930,11 +1083,13 @@ class ConsensusCommittee:
     """
 
     DS_SYSTEM = (
-        "You are a crypto technical analyst evaluating oversold bounce setups. "
-        "You receive dual-timeframe RSI data (1D and 4H) and horizontal support information. "
-        "BUY conditions: RSI oversold on BOTH timeframes (1D<30 AND 4H<35) is a strong signal. "
-        "A confirmed horizontal support level (2+ historical touches) is required unless RSI is extremely oversold (<22). "
-        "SKIP if: only one timeframe is oversold with no support, or if the pattern looks like a falling knife (no bounce attempts). "
+        "You are a crypto technical analyst evaluating momentum bounce setups. "
+        "Entry logic: RSI was oversold (<30) and has now bounced above 35 (confirmation), "
+        "AND EMA9 is above EMA21 (short-term uptrend confirmed). "
+        "This is NOT a falling knife setup — the bounce has already started. "
+        "BUY if: RSI bounce confirmed + EMA alignment + horizontal support adds confluence. "
+        "SKIP if: RSI bounce looks like a dead-cat bounce (no volume), or EMA still bearish, "
+        "or price rejected at a major resistance level just above entry. "
         "Respond with exactly one word on the last line: BUY or SKIP."
     )
     LLAMA_SYSTEM = (
@@ -2691,16 +2846,33 @@ class ScalpingOrchestrator:
             except Exception:
                 pass
 
+            # ── EMA 9/21 على 4H للـ EMA Crossover ──
+            ema9  = float(df_4h["close"].ewm(span=9,  adjust=False).mean().iloc[-1]) if "df_4h" in dir() else current
+            ema21 = float(df_4h["close"].ewm(span=21, adjust=False).mean().iloc[-1]) if "df_4h" in dir() else current
+
+            # ── RSI السابق (5 شموع) للـ RSI Bounce Confirmation ──
+            rsi_4h_prev = float((100 - 100 / (1 + (
+                df_4h["close"].diff().clip(lower=0).rolling(14).mean() /
+                (-df_4h["close"].diff().clip(upper=0).rolling(14).mean().replace(0, 1e-9))
+            ))).iloc[-6]) if "df_4h" in dir() and len(df_4h) >= 20 else rsi_4h
+
+            # ── ATR للـ Cost Gate ──
+            atr_val = calculate_atr(df_4h) if "df_4h" in dir() else 0.0
+
             return {
-                "current":  current,
-                "rsi":      rsi_decision,
-                "rsi_1d":   rsi_1d,
-                "rsi_4h":   rsi_4h,
-                "rsi_note": rsi_note,
-                "fib_high": fib_high,
-                "fib_low":  fib_low,
-                "vol_usd":  vol_usd,
-                "support":  support,
+                "current":      current,
+                "rsi":          rsi_decision,
+                "rsi_1d":       rsi_1d,
+                "rsi_4h":       rsi_4h,
+                "rsi_4h_prev":  rsi_4h_prev,
+                "rsi_note":     rsi_note,
+                "fib_high":     fib_high,
+                "fib_low":      fib_low,
+                "vol_usd":      vol_usd,
+                "support":      support,
+                "ema9":         ema9,
+                "ema21":        ema21,
+                "atr":          atr_val,
             }
         except Exception as e:
             _log(f"[Scan] ❌ {symbol}: {type(e).__name__}: {str(e)[:80]}")
@@ -2737,8 +2909,43 @@ class ScalpingOrchestrator:
         if not ind:
             return
 
-        rsi_note = ind.get("rsi_note", "")
-        _log(f"[Scan] {symbol}: RSI={ind['rsi']:.1f} ({rsi_note}) Vol=${ind['vol_usd']/1e6:.1f}M")
+        rsi_note    = ind.get("rsi_note", "")
+        rsi_4h      = ind.get("rsi_4h", ind["rsi"])
+        rsi_4h_prev = ind.get("rsi_4h_prev", rsi_4h)
+        ema9        = ind.get("ema9", 0.0)
+        ema21       = ind.get("ema21", 0.0)
+        atr_val     = ind.get("atr", 0.0)
+        current     = ind["current"]
+
+        _log(f"[Scan] {symbol}: RSI_4H={rsi_4h:.1f} (prev={rsi_4h_prev:.1f}) EMA9={ema9:.6g}/EMA21={ema21:.6g} Vol=${ind['vol_usd']/1e6:.1f}M")
+
+        # ════════════════════════════════════════════════════════
+        # الاستراتيجية 1: RSI Bounce Confirmation
+        # الإصلاح الجذري — بدل الشراء عند RSI<30 مباشرة
+        # ننتظر تأكيد الارتداد الفعلي
+        # ════════════════════════════════════════════════════════
+        if self.cfg.rsi_bounce_enabled:
+            rsi_was_oversold = rsi_4h_prev <= self.cfg.rsi_threshold
+            rsi_now_bouncing = rsi_4h >= self.cfg.rsi_bounce_entry
+            if not (rsi_was_oversold and rsi_now_bouncing):
+                # RSI لم يرتد بعد من التشبع البيعي
+                _log(
+                    f"[RSI Bounce ❌] {symbol}: "
+                    f"prev={rsi_4h_prev:.1f} (كان<{self.cfg.rsi_threshold}? {rsi_was_oversold}) "
+                    f"now={rsi_4h:.1f} (>={self.cfg.rsi_bounce_entry}? {rsi_now_bouncing})"
+                )
+                return
+            _log(f"[RSI Bounce ✅] {symbol}: ارتد من {rsi_4h_prev:.1f} إلى {rsi_4h:.1f} — تأكيد الارتداد")
+
+        # ════════════════════════════════════════════════════════
+        # الاستراتيجية 2: EMA Crossover 9/21
+        # الدخول فقط عند تأكيد اتجاه قصير المدى صاعد
+        # ════════════════════════════════════════════════════════
+        if self.cfg.ema_cross_enabled and ema9 > 0 and ema21 > 0:
+            if ema9 <= ema21:
+                _log(f"[EMA Cross ❌] {symbol}: EMA{self.cfg.ema_fast}={ema9:.6g} ≤ EMA{self.cfg.ema_slow}={ema21:.6g} — اتجاه هابط")
+                return
+            _log(f"[EMA Cross ✅] {symbol}: EMA9={ema9:.6g} > EMA21={ema21:.6g} — اتجاه صاعد")
 
         # ── فلتر BTC: لا شراء إذا كان السوق العام في هبوط قوي ──
         btc_rsi = await asyncio.get_running_loop().run_in_executor(
@@ -2852,6 +3059,20 @@ class ScalpingOrchestrator:
             sl_max = ind["current"] * (1 - self.cfg.s1_sl_min / 100)
             stop_loss = max(sl_min, min(raw_sl, sl_max))
 
+        # ════════════════════════════════════════════════════════
+        # الاستراتيجية 3: Cost Gate
+        # رفض الصفقة إذا كانت الحركة المتوقعة لا تغطي الرسوم + هامش ربح
+        # ════════════════════════════════════════════════════════
+        if self.cfg.cost_gate_enabled:
+            tp1_distance_pct = (targets["tp1"] - ind["current"]) / ind["current"] * 100
+            if tp1_distance_pct < self.cfg.cost_gate_pct:
+                _log(
+                    f"[Cost Gate ❌] {symbol}: TP1 بعيد {tp1_distance_pct:.2f}% "
+                    f"< حد أدنى {self.cfg.cost_gate_pct}% — لا يغطي الرسوم"
+                )
+                return
+            _log(f"[Cost Gate ✅] {symbol}: TP1 = +{tp1_distance_pct:.2f}% > {self.cfg.cost_gate_pct}%")
+
         _log(
             f"[L2 ✅] {symbol} ({result['elapsed']}s) | "
             f"TP1={targets['tp1']:.6g} TP2={targets['tp2']:.6g} "
@@ -2940,9 +3161,10 @@ class ScalpingOrchestrator:
 
         # ── تسجيل الصفقة في Supabase ──
         committee_summary = (
-            f"RSI تشبع بيعي | DeepSeek={result['ds_vote']} | "
-            f"Llama={result['llama_vote']} | RSS={rss_sentiment} | "
-            f"Galaxy={lunar_data.get('galaxy_score', 0):.0f}"
+            f"RSI Bounce: {rsi_4h_prev:.1f}→{rsi_4h:.1f} | "
+            f"EMA9/21: {'✅' if ema9>ema21 else '❌'} | "
+            f"DeepSeek={result['ds_vote']} | Llama={result['llama_vote']} | "
+            f"RSS={rss_sentiment} | Galaxy={lunar_data.get('galaxy_score', 0):.0f}"
         )
         trade_id = await asyncio.get_running_loop().run_in_executor(
             None,
@@ -2999,7 +3221,8 @@ class ScalpingOrchestrator:
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"💼 الرصيد: <code>${initial_balance:.2f}</code> → <code>${current_balance:.2f}</code>\n"
             f"📊 إجمالي أرباح الشهر: <code>${m_sign}{m_pnl:.2f}</code> ({m_count} صفقة)\n"
-            f"🧠 Committee: DS={result['ds_vote']} | Llama={result['llama_vote']} | RSS={rss_sentiment}\n"
+            f"🧠 DS={result['ds_vote']} | Llama={result['llama_vote']} | RSS={rss_sentiment}\n"
+            f"📈 RSI Bounce: {rsi_4h_prev:.1f}→{rsi_4h:.1f} | EMA9/21: {'✅' if ema9>ema21 else '❌'}\n"
             + (
                 f"📍 دعم أفقي مؤكَّد: {support_data['touches']} لمسات سابقة\n"
                 if support_data.get("has_support") else ""
@@ -3697,17 +3920,50 @@ class ScalpingOrchestrator:
 
             entry_price = ind["current"]
 
-            # ── حساب Liquidation وSL ──
+            # ── ATR من المؤشرات (محسوب مسبقاً) أو إعادة الحساب ──
+            atr = ind.get("atr", 0.0)
+            if atr <= 0:
+                try:
+                    atr = calculate_atr(
+                        pd.DataFrame(
+                            self.futures_executor.exchange.fetch_ohlcv(symbol, "4h", limit=20),
+                            columns=["ts","open","high","low","close","vol"]
+                        ).astype(float)
+                    )
+                except Exception:
+                    pass
+
+            if self.cfg.futures_dynamic_lev and atr > 0:
+                dynamic_lev, lev_reason = calculate_dynamic_leverage(
+                    entry_price   = entry_price,
+                    atr           = atr,
+                    rsi           = ind["rsi"],
+                    support_score = support_data.get("score", 0),
+                    whale_signal  = whale_data.get("whale_alert", "none"),
+                    galaxy_score  = lunar_data.get("galaxy_score", 50),
+                    sl_pct        = self.cfg.futures_sl_pct,
+                    lev_min       = self.cfg.futures_leverage_min,
+                    lev_max       = self.cfg.futures_leverage_max,
+                )
+                _log(f"[Dynamic Lev] {symbol}: {lev_reason}")
+            else:
+                dynamic_lev = self.cfg.futures_leverage
+                lev_reason  = f"ثابت={dynamic_lev}x (FUTURES_DYNAMIC_LEVERAGE=false)"
+
+            # ── حساب Liquidation وSL بالرافعة الديناميكية ──
             liq_price = calculate_liquidation_price(
-                entry_price, self.cfg.futures_leverage, self.cfg.futures_margin_mode
+                entry_price, dynamic_lev, self.cfg.futures_margin_mode
             )
             stop_loss = calculate_safe_sl_futures(
-                entry_price, self.cfg.futures_leverage,
+                entry_price, dynamic_lev,
                 self.cfg.futures_sl_pct, liq_price, self.cfg.futures_liq_buffer
             )
             tp1 = entry_price * (1 + self.cfg.futures_tp1_pct / 100)
             tp2 = entry_price * (1 + self.cfg.futures_tp2_pct / 100)
             tp3 = tp2 * 1.02
+
+            # ── تحديث الرافعة في Config مؤقتاً للـ executor ──
+            object.__setattr__(self.futures_executor.cfg, "futures_leverage", dynamic_lev)
 
             # ── تنفيذ الصفقة عبر futures_executor ──
             state = await asyncio.get_running_loop().run_in_executor(
@@ -3741,23 +3997,28 @@ class ScalpingOrchestrator:
             if trade_id:
                 self.slots.update_state(symbol, db_trade_id=trade_id)
 
-            lev = self.cfg.futures_leverage
+            lev     = dynamic_lev
             tp1_eff = (tp1 / entry_price - 1) * 100 * lev
             sl_eff  = (1 - stop_loss / entry_price) * 100 * lev
+            atr_pct = (atr / entry_price * 100) if entry_price > 0 else 0
 
             await self._send_telegram(
                 "⚡ <b>صفقة Futures جديدة — Long</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"📌 <b>العملة:</b> <code>{symbol}</code>\n"
-                f"💰 <b>رأس المال:</b> <code>${self.cfg.capital:.2f}</code> × {lev}x\n"
+                f"💰 <b>رأس المال:</b> <code>${self.cfg.capital:.2f}</code> × {lev}x "
+                f"({'ديناميكي 🧠' if self.cfg.futures_dynamic_lev else 'ثابت'})\n"
                 f"📈 <b>سعر الدخول:</b> <code>{entry_price:.8g}</code>\n"
-                f"📦 <b>الكمية:</b> <code>{state.filled_qty:.4f}</code>\n\n"
+                f"📦 <b>الكمية:</b> <code>{state.filled_qty:.4f}</code>\n"
+                f"📊 <b>ATR 4H:</b> <code>{atr_pct:.2f}%</code> (تقلب يومي)\n\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 TP1: <code>{tp1:.8g}</code> (+{self.cfg.futures_tp1_pct:.1f}% | فعلي +{tp1_eff:.1f}%)\n"
                 f"🎯 TP2: <code>{tp2:.8g}</code> (+{self.cfg.futures_tp2_pct:.1f}% | فعلي +{self.cfg.futures_tp2_pct*lev:.1f}%)\n"
                 f"🛡 SL:  <code>{stop_loss:.8g}</code> (-{self.cfg.futures_sl_pct:.1f}% | فعلي -{sl_eff:.1f}%)\n"
                 f"☠️ Liq: <code>{liq_price:.8g}</code>\n\n"
-                f"🧠 DS={result['ds_vote']} | Llama={result['llama_vote']} | BTC RSI={btc_rsi:.1f}"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"🧠 DS={result['ds_vote']} | Llama={result['llama_vote']} | BTC RSI={btc_rsi:.1f}\n"
+                f"📐 {lev_reason[:80]}"
             )
 
         finally:
@@ -3810,16 +4071,21 @@ class ScalpingOrchestrator:
                 except Exception:
                     pass
 
+            # حساب ATR هنا ليُستخدم لاحقاً في الرافعة الديناميكية
+            atr = calculate_atr(df_4h)
+            atr_pct = (atr / current * 100) if current > 0 else 0
+
             return {
                 "current":  current,
                 "rsi":      rsi_4h,
                 "rsi_1d":   rsi_4h,
                 "rsi_4h":   rsi_4h,
-                "rsi_note": f"futures⚡ RSI_4H={rsi_4h:.1f}",
+                "rsi_note": f"futures⚡ RSI_4H={rsi_4h:.1f} ATR={atr_pct:.2f}%",
                 "fib_high": fib_high,
                 "fib_low":  fib_low,
                 "vol_usd":  vol_usd,
                 "support":  support,
+                "atr":      atr,
             }
         except Exception as e:
             _log(f"[Futures Scan] ❌ {symbol}: {str(e)[:60]}")
@@ -3831,7 +4097,8 @@ class ScalpingOrchestrator:
             await self._send_telegram(
                 "⚡ <b>تحذير: وضع Futures مفعَّل</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"• <b>الرافعة:</b> <code>{self.cfg.futures_leverage}x</code>\n"
+                f"• <b>الرافعة:</b> {'ديناميكية 🧠' if self.cfg.futures_dynamic_lev else 'ثابتة'} "
+                f"({self.cfg.futures_leverage_min}x - {self.cfg.futures_leverage_max}x)\n"
                 f"• <b>Margin Mode:</b> <code>{self.cfg.futures_margin_mode}</code>\n"
                 f"• <b>SL:</b> <code>-{self.cfg.futures_sl_pct}%</code> "
                 f"(فعلي: -{self.cfg.futures_sl_pct * self.cfg.futures_leverage:.1f}% بالرافعة)\n"
